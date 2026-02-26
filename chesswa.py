@@ -501,14 +501,12 @@ game_hub = GameHub()
 async def register_start(req: Request, _: None = Depends(api_key_dep)):
     body = await req.json()
     tag = norm_tag(body.get("tag", ""))
-    nickname = (body.get("nickname") or "").strip()
     gender = (body.get("gender") or "").strip().lower()
     skill = int(body.get("skill") or 0)
 
-    if not nickname or gender not in ("m", "f") or skill not in (1, 2, 3, 4, 5):
+    if not tag or gender not in ("m", "f") or skill not in (1, 2, 3, 4, 5):
         return JSONResponse({"ok": False, "reason": "bad_fields"}, status_code=400)
 
-    # если tg user не запускал бота => в жопу
     if not has_tg_user(tag):
         return JSONResponse({"ok": False, "reason": "tg_not_started"}, status_code=400)
 
@@ -516,10 +514,15 @@ async def register_start(req: Request, _: None = Depends(api_key_dep)):
     if u:
         return JSONResponse({"ok": False, "reason": "already_registered"}, status_code=400)
 
-    # женский пол => бан после ввода кода (по твоим правилам)
     code = set_pending_code(tag, "register")
-    # Здесь должен быть реальный отправитель кода через бот.
-    # Сейчас просто возвращаем ok, а бот ты уже дергаешь в своём отдельном коде.
+
+    # отправляем код в Telegram
+    with db() as con:
+        tg_row = con.execute("SELECT tg_id FROM tg_users WHERE tag=?", (tag,)).fetchone()
+
+    if tg_row and tg_row["tg_id"]:
+        await tg_send(int(tg_row["tg_id"]), f"Код регистрации: {code}")
+
     return JSONResponse({"ok": True, "sent": True})
 
 @app.post("/api/auth/login_start")
@@ -537,7 +540,14 @@ async def login_start(req: Request, _: None = Depends(api_key_dep)):
     if int(u["banned"]) == 1:
         return JSONResponse({"ok": False, "reason": "banned"}, status_code=403)
 
-    set_pending_code(tag, "login")
+    code = set_pending_code(tag, "login")
+
+    with db() as con:
+        tg_row = con.execute("SELECT tg_id FROM tg_users WHERE tag=?", (tag,)).fetchone()
+
+    if tg_row and tg_row["tg_id"]:
+        await tg_send(int(tg_row["tg_id"]), f"Код входа: {code}")
+
     return JSONResponse({"ok": True, "sent": True})
 
 @app.post("/api/auth/verify")
