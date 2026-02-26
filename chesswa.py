@@ -176,10 +176,11 @@ def session_dep(
 # Users helpers
 # =========================================================
 def norm_tag(tag: str) -> str:
-    t = (tag or "").strip()
-    if not t.startswith("@"):
-        t = "@" + t
-    return t
+    t = (tag or '').strip()
+    if not t.startswith('@'):
+        t = '@' + t
+    return t.lower()
+
 
 def get_user(tag: str) -> Optional[sqlite3.Row]:
     with db() as con:
@@ -189,6 +190,17 @@ def has_tg_user(tag: str) -> bool:
     with db() as con:
         r = con.execute("SELECT tag FROM tg_users WHERE tag=?", (tag,)).fetchone()
     return bool(r)
+
+
+def get_tg_id(tag: str) -> Optional[int]:
+    with db() as con:
+        r = con.execute('SELECT tg_id FROM tg_users WHERE tag=?', (tag,)).fetchone()
+    if not r:
+        return None
+    try:
+        return int(r['tg_id'])
+    except Exception:
+        return None
 
 def set_pending_code(tag: str, purpose: str) -> str:
     code = f"{secrets.randbelow(1000000):06d}"
