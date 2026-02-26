@@ -1162,3 +1162,54 @@ async def ws_game(ws: WebSocket, gid: str):
         pass
     finally:
         await game_hub.remove(gid, ws)
+
+# =========================================================
+# TELEGRAM WEBHOOK
+# =========================================================
+import httpx
+
+async def tg_send(chat_id: int, text: str):
+    if not BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={
+            "chat_id": chat_id,
+            "text": text
+        })
+
+@app.post("/webhook")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+
+    message = data.get("message")
+    if not message:
+        return {"ok": True}
+
+    text = message.get("text", "")
+    chat = message.get("chat", {})
+    user = message.get("from", {})
+
+    tg_id = user.get("id")
+    tg_username = user.get("username")
+
+    if not tg_id or not tg_username:
+        return {"ok": True}
+
+    tag = norm_tag(tg_username)
+
+    # сохраняем tg_users
+    with db() as con:
+        con.execute("""
+        INSERT INTO tg_users(tag, tg_id, tg_username, created_ts)
+        VALUES (?,?,?,?)
+        ON CONFLICT(tag) DO UPDATE SET
+            tg_id=excluded.tg_id,
+            tg_username=excluded.tg_username
+        """, (tag, tg_id, tg_username, now_ts()))
+        con.commit()
+
+    if text.startswith("/start"):
+        await tg_send(chat["id"], "Бот подключён. Теперь можешь авторизоваться в игре.")
+
+    return {"ok": True}
