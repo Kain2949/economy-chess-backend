@@ -437,6 +437,7 @@ def capture_bonus2(mover: chess.Piece, captured: chess.Piece) -> int:
 # =========================================================
 # WebSocket hubs
 # =========================================================
+
 class LobbyHub:
     def __init__(self):
         self.conns: Dict[str, Set[WebSocket]] = {}
@@ -446,12 +447,16 @@ class LobbyHub:
         async with self.lock:
             self.conns.setdefault(tag, set()).add(ws)
 
+        await self.broadcast_online()
+
     async def remove(self, tag: str, ws: WebSocket):
         async with self.lock:
             if tag in self.conns and ws in self.conns[tag]:
                 self.conns[tag].remove(ws)
             if tag in self.conns and not self.conns[tag]:
                 del self.conns[tag]
+
+        await self.broadcast_online()
 
     async def send_to(self, tag: str, payload: Dict[str, Any]):
         async with self.lock:
@@ -463,20 +468,24 @@ class LobbyHub:
                 pass
 
     async def broadcast_online(self):
-        # онлайн = кто держит ws и шлёт heartbeat
-        with db() as con:
-            rows = con.execute("SELECT tag FROM lobby_online WHERE last_ts>=?", (now_ts() - 40,)).fetchall()
-        tags = [r["tag"] for r in rows]
+        async with self.lock:
+            tags = list(self.conns.keys())
+
         online = []
         for t in tags:
             u = get_user(t)
             if u and int(u["banned"]) == 0:
-                online.append({"tag": t, "nickname": u["nickname"]})
-        # всем, кто в хабе
-        async with self.lock:
-            all_tags = list(self.conns.keys())
-        for t in all_tags:
-            await self.send_to(t, {"type": "online", "data": {"online": online}})
+                online.append({
+                    "tag": t,
+                    "nickname": u["nickname"]
+                })
+
+        for t in tags:
+            await self.send_to(t, {
+                "type": "online",
+                "data": {"online": online}
+            })
+
 
 class GameHub:
     def __init__(self):
@@ -502,6 +511,7 @@ class GameHub:
                 await ws.send_text(json.dumps(payload, ensure_ascii=False))
             except Exception:
                 pass
+
 
 lobby_hub = LobbyHub()
 game_hub = GameHub()
@@ -1119,8 +1129,6 @@ def ws_key_ok(key: str) -> bool:
 
 @app.websocket("/ws/lobby")
 async def ws_lobby(ws: WebSocket):
-    await ws.accept()
-
     key = ws.query_params.get("key", "")
     token = ws.query_params.get("token", "")
 
@@ -1133,19 +1141,13 @@ async def ws_lobby(ws: WebSocket):
         await ws.close(code=4401)
         return
 
+    await ws.accept()
     await lobby_hub.add(tag, ws)
 
     try:
         while True:
+            # просто держим соединение живым
             await ws.receive_text()
-            with db() as con:
-                con.execute("""
-                INSERT INTO lobby_online(tag, last_ts)
-                VALUES (?,?)
-                ON CONFLICT(tag) DO UPDATE SET last_ts=excluded.last_ts
-                """, (tag, now_ts()))
-                con.commit()
-            await lobby_hub.broadcast_online()
     except WebSocketDisconnect:
         pass
     finally:
