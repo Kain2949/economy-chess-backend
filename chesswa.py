@@ -1119,33 +1119,34 @@ def ws_key_ok(key: str) -> bool:
 
 @app.websocket("/ws/lobby")
 async def ws_lobby(ws: WebSocket):
+    await ws.accept()
+
     key = ws.query_params.get("key", "")
     token = ws.query_params.get("token", "")
+
     if not ws_key_ok(key):
         await ws.close(code=4401)
         return
+
     tag = load_session_tag(token)
     if not tag:
         await ws.close(code=4401)
         return
 
-    await ws.accept()
     await lobby_hub.add(tag, ws)
 
     try:
         while True:
-            # heartbeat
             await ws.receive_text()
             with db() as con:
                 con.execute("""
-                INSERT INTO lobby_online(tag, last_ts) VALUES (?,?)
+                INSERT INTO lobby_online(tag, last_ts)
+                VALUES (?,?)
                 ON CONFLICT(tag) DO UPDATE SET last_ts=excluded.last_ts
                 """, (tag, now_ts()))
                 con.commit()
             await lobby_hub.broadcast_online()
     except WebSocketDisconnect:
-        pass
-    except Exception:
         pass
     finally:
         await lobby_hub.remove(tag, ws)
