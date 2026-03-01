@@ -710,8 +710,8 @@ async def lobby_invite_accept(req: Request, tag: str = Depends(session_dep)):
     # создаём игру
     gid = create_game(from_tag, tag, minutes)
 
-    await lobby_hub.send_to(from_tag, {"type": "game_created", "data": {"game_id": gid}})
-    await lobby_hub.send_to(tag, {"type": "game_created", "data": {"game_id": gid}})
+    await lobby_hub.send_to(from_tag, {"type": "game_created", "data": {"game_id": gid, "w_tag": from_tag, "b_tag": tag}})
+    await lobby_hub.send_to(tag, {"type": "game_created", "data": {"game_id": gid, "w_tag": from_tag, "b_tag": tag}})
     return JSONResponse({"ok": True, "game_id": gid})
 
 @app.post("/api/lobby/invite_decline")
