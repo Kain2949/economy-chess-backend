@@ -7,6 +7,9 @@ import sqlite3
 import asyncio
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional, Set, List
+import bcrypt
+import smtplib
+from email.mime.text import MIMEText
 
 import chess
 import httpx
@@ -17,24 +20,21 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # ENV
 # =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEB_SECRET_KEY = os.getenv("WEB_SECRET_KEY", "")
 DB_PATH = os.getenv("DB_PATH", "./database.db")
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8000"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 INVITE_TTL_SECONDS = int(os.getenv("INVITE_TTL_SECONDS", "120"))
 CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "")
+
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "e.vlasov2949@gmail.com")
 
 # =========================================================
 # Admin / Ban debug (MVP)
 # =========================================================
-ADMIN_TG_ID_RAW = (os.getenv("ADMIN_TG_ID", "") or "").strip()
-try:
-    ADMIN_TG_ID_INT: Optional[int] = int(ADMIN_TG_ID_RAW) if ADMIN_TG_ID_RAW else None
-except Exception:
-    ADMIN_TG_ID_INT = None
 
 # Safe test mechanism: if enabled, user registering with gender "f" gets a 10-year ban.
 DEBUG_BAN_WOMEN_ON_REGISTER = (os.getenv("DEBUG_BAN_WOMEN_ON_REGISTER", "") or "").strip().lower() in (
@@ -161,18 +161,12 @@ def init_db() -> None:
     with db() as con:
         con.execute(
             """
-            CREATE TABLE IF NOT EXISTS tg_users (
-                tag TEXT PRIMARY KEY,
-                tg_id INTEGER,
-                tg_username TEXT,
-                created_ts INTEGER
-            )
-            """
-        )
-        con.execute(
-            """
             CREATE TABLE IF NOT EXISTS users (
-                tag TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE,
+                password_hash TEXT,
+                email_verified INTEGER DEFAULT 0,
                 nickname TEXT NOT NULL,
                 gender TEXT NOT NULL,
                 skill INTEGER NOT NULL,
@@ -194,10 +188,12 @@ def init_db() -> None:
         )
         con.execute(
             """
-            CREATE TABLE IF NOT EXISTS pending_codes (
-                tag TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS email_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 code TEXT NOT NULL,
-                purpose TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                used INTEGER DEFAULT 0,
                 created_ts INTEGER NOT NULL,
                 expires_ts INTEGER NOT NULL
             )
@@ -241,8 +237,7 @@ def init_db() -> None:
                 created_ts INTEGER NOT NULL,
                 expires_ts INTEGER NOT NULL, -- 0 => permanent
                 revoked_ts INTEGER,
-                created_by_tag TEXT,
-                created_by_tg_id INTEGER NOT NULL
+                created_by_tag TEXT
             )
             """
         )
@@ -431,15 +426,8 @@ def _norm_admin_reason(reason: str) -> str:
 
 
 def _is_tag_admin(con: sqlite3.Connection, tag: str) -> bool:
-    if ADMIN_TG_ID_INT is None:
-        return False
-    row = con.execute("SELECT tg_id FROM tg_users WHERE tag=?", (tag,)).fetchone()
-    if not row:
-        return False
-    try:
-        return int(row["tg_id"]) == int(ADMIN_TG_ID_INT)
-    except Exception:
-        return False
+    row = con.execute("SELECT email FROM users WHERE tag=?", (tag,)).fetchone()
+    return bool(row) and str(row["email"]) == ADMIN_EMAIL
 
 
 def _get_active_ban_row(con: sqlite3.Connection, tag: str, now: int) -> Optional[sqlite3.Row]:
@@ -525,56 +513,36 @@ def has_tg_user(tag: str) -> bool:
     return bool(row)
 
 
-def get_tg_id(tag: str) -> Optional[int]:
-    with db() as con:
-        row = con.execute("SELECT tg_id FROM tg_users WHERE tag=?", (tag,)).fetchone()
-    if not row:
-        return None
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
     try:
-        return int(row["tg_id"])
+        return bcrypt.checkpw(password.encode(), hashed.encode())
     except Exception:
-        return None
-
-
-def set_pending_code(tag: str, purpose: str) -> str:
-    code = f"{secrets.randbelow(1000000):06d}"
-    now = now_ts()
-    exp = now + 10 * 60
-    with db() as con:
-        con.execute(
-            """
-            INSERT INTO pending_codes(tag, code, purpose, created_ts, expires_ts)
-            VALUES (?,?,?,?,?)
-            ON CONFLICT(tag) DO UPDATE SET
-                code=excluded.code,
-                purpose=excluded.purpose,
-                created_ts=excluded.created_ts,
-                expires_ts=excluded.expires_ts
-            """,
-            (tag, code, purpose, now, exp),
-        )
-        con.commit()
-    return code
-
-
-def check_pending_code(tag: str, code: str, purpose: str) -> bool:
-    with db() as con:
-        row = con.execute("SELECT * FROM pending_codes WHERE tag=?", (tag,)).fetchone()
-    if not row:
         return False
-    if str(row["purpose"]) != purpose:
-        return False
-    if str(row["code"]) != str(code):
-        return False
-    if int(row["expires_ts"]) < now_ts():
-        return False
-    return True
 
+def generate_code() -> str:
+    return f"{secrets.randbelow(1000000):06d}"
 
-def clear_pending_code(tag: str) -> None:
-    with db() as con:
-        con.execute("DELETE FROM pending_codes WHERE tag=?", (tag,))
-        con.commit()
+def send_email_code(email: str, code: str) -> None:
+    try:
+        msg = MIMEText(f"Economy Chess Login Code: {code}")
+        msg["Subject"] = "Economy Chess Auth"
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = email
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+def get_latest_email_code(con: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM email_codes WHERE user_id=? AND used=0 ORDER BY created_ts DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
 
 
 def create_session(tag: str) -> str:
@@ -1175,113 +1143,159 @@ game_hub = GameHub()
 # =========================================================
 # AUTH API
 # =========================================================
-@app.post("/api/auth/register_start")
-async def register_start(req: Request, _: None = Depends(api_key_dep)):
+@app.post("/api/auth/register")
+async def register(req: Request, _: None = Depends(api_key_dep)):
     body = await req.json()
-    tag = norm_tag(body.get("tag", ""))
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password", "")
+    password_confirm = body.get("password_confirm", "")
+    nickname = (body.get("nickname") or "").strip()
     gender = (body.get("gender") or "").strip().lower()
     skill = int(body.get("skill") or 0)
 
-    if not tag or gender not in ("m", "f") or skill not in SKILL_TO_ELO:
+    if not email or "@" not in email:
+        return JSONResponse({"ok": False, "reason": "bad_email"}, status_code=400)
+    if len(password) < 8 or not any(c.isdigit() for c in password):
+        return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
+    if password != password_confirm:
+        return JSONResponse({"ok": False, "reason": "password_mismatch"}, status_code=400)
+    if not nickname or gender not in ("m", "f") or skill not in SKILL_TO_ELO:
         return JSONResponse({"ok": False, "reason": "bad_fields"}, status_code=400)
-    if not has_tg_user(tag):
-        return JSONResponse({"ok": False, "reason": "tg_not_started"}, status_code=400)
-    if get_user(tag):
-        return JSONResponse({"ok": False, "reason": "already_registered"}, status_code=400)
 
-    code = set_pending_code(tag, "register")
-    tg_id = get_tg_id(tag)
-    if tg_id:
-        await tg_send(tg_id, f"Код регистрации: {code}")
-
-    return JSONResponse({"ok": True, "sent": True})
-
-
-@app.post("/api/auth/login_start")
-async def login_start(req: Request, _: None = Depends(api_key_dep)):
-    body = await req.json()
-    tag = norm_tag(body.get("tag", ""))
-
-    if not has_tg_user(tag):
-        return JSONResponse({"ok": False, "reason": "tg_not_started"}, status_code=400)
-
-    user = get_user(tag)
-    if not user:
-        return JSONResponse({"ok": False, "reason": "not_registered"}, status_code=400)
-
-    code = set_pending_code(tag, "login")
-    tg_id = get_tg_id(tag)
-    if tg_id:
-        await tg_send(tg_id, f"Код входа: {code}")
-
-    return JSONResponse({"ok": True, "sent": True})
-
-
-@app.post("/api/auth/verify")
-async def auth_verify(req: Request, _: None = Depends(api_key_dep)):
-    body = await req.json()
-
-    tag = norm_tag(body.get("tag", ""))
-    code = (body.get("code") or "").strip()
-    raw_mode = (body.get("mode") or "").strip().lower()
-
-    if raw_mode in ("login", "login_start"):
-        mode = "login"
-    elif raw_mode in ("register", "register_start"):
-        mode = "register"
-    else:
-        return JSONResponse({"ok": False, "reason": "bad_mode"}, status_code=400)
-
-    if not tag or not code:
-        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
-    if not check_pending_code(tag, code, mode):
-        return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
-
-    if mode == "register":
-        nickname = (body.get("nickname") or "").strip()
-        gender = (body.get("gender") or "").strip().lower()
-        skill = int(body.get("skill") or 0)
-
-        if not nickname or gender not in ("m", "f") or skill not in SKILL_TO_ELO:
-            return JSONResponse({"ok": False, "reason": "bad_fields"}, status_code=400)
-        if get_user(tag):
-            return JSONResponse({"ok": False, "reason": "already_registered"}, status_code=400)
+    import random
+    tag_candidate = f"@{nickname.lower().replace(' ', '')}_{random.randint(1000, 9999)}"
+    
+    with db() as con:
+        if con.execute("SELECT email FROM users WHERE email=?", (email,)).fetchone():
+            return JSONResponse({"ok": False, "reason": "email_taken"}, status_code=400)
+        
+        while con.execute("SELECT tag FROM users WHERE tag=?", (tag_candidate,)).fetchone():
+            tag_candidate = f"@{nickname.lower().replace(' ', '')}_{random.randint(1000, 9999)}"
 
         elo = SKILL_TO_ELO[skill]
-        with db() as con:
-            con.execute(
-                "INSERT INTO users(tag, nickname, gender, skill, elo, banned, created_ts) VALUES (?,?,?,?,?,?,?)",
-                (tag, nickname, gender, skill, elo, 0, now_ts()),
-            )
-            con.commit()
+        pwd_hash = hash_password(password)
 
+        con.execute(
+            """
+            INSERT INTO users(tag, email, password_hash, email_verified, nickname, gender, skill, elo, banned, created_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (tag_candidate, email, pwd_hash, 0, nickname, gender, skill, elo, 0, now_ts()),
+        )
+        
         # Safe debug autoban (server-side env flag only).
         if DEBUG_BAN_WOMEN_ON_REGISTER and gender == "f":
             now = now_ts()
             expires_ts = now + int(DEBUG_BAN_WOMEN_SECONDS)
-            created_by_tg_id = int(ADMIN_TG_ID_INT or 0)
             reason = "debug_autoban_women_10y"
-            with db() as con:
-                con.execute(
-                    """
-                    INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag, created_by_tg_id)
-                    VALUES (?,?,?,?,?,?,?)
-                    """,
-                    (tag, reason, now, expires_ts, None, None, created_by_tg_id),
-                )
-                con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag,))
-                con.commit()
+            con.execute(
+                """
+                INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (tag_candidate, reason, now, expires_ts, None, None),
+            )
+            con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag_candidate,))
+            
+        con.commit()
 
-    user = get_user(tag)
-    if not user:
-        return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+    return JSONResponse({"ok": True})
 
-    clear_pending_code(tag)
+@app.post("/api/auth/login")
+async def auth_login(req: Request, _: None = Depends(api_key_dep)):
+    body = await req.json()
+    identifier = (body.get("identifier") or "").strip().lower()
+    password = body.get("password", "")
+
+    if not identifier or not password:
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    with db() as con:
+        user = con.execute("SELECT id, email, password_hash FROM users WHERE email=? OR tag=? OR nickname=?", (identifier, identifier, identifier)).fetchone()
+        if not user:
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+
+        if not verify_password(password, str(user["password_hash"])):
+            return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
+        
+        user_id = int(user["id"])
+        email = str(user["email"])
+        now = now_ts()
+
+        recent_reqs = con.execute(
+            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
+            (user_id, now - 600)
+        ).fetchone()
+        if recent_reqs and recent_reqs["c"] >= 5:
+            return JSONResponse({"ok": False, "reason": "rate_limit"}, status_code=429)
+
+        recent_fast = con.execute(
+            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
+             (user_id, now - 30)
+        ).fetchone()
+        if recent_fast and recent_fast["c"] > 0:
+            return JSONResponse({"ok": False, "reason": "rate_limit_30s"}, status_code=429)
+
+        con.execute("UPDATE email_codes SET used=1 WHERE user_id=?", (user_id,))
+        
+        code = generate_code()
+        exp = now + 10 * 60
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (user_id, code, now, exp)
+        )
+        con.commit()
+
+    import threading
+    t = threading.Thread(target=send_email_code, args=(email, code))
+    t.start()
+
+    masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
+    return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
+
+@app.post("/api/auth/verify-code")
+async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
+    body = await req.json()
+    email = (body.get("email") or "").strip().lower()
+    code = (body.get("code") or "").strip()
+
+    if not email or not code:
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    now = now_ts()
+    with db() as con:
+        user = con.execute("SELECT id, tag, nickname, elo, skill FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+            
+        user_id = int(user["id"])
+        tag = str(user["tag"])
+
+        email_record = get_latest_email_code(con, user_id)
+        if not email_record:
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+            
+        attempts = int(email_record["attempts"])
+        if attempts >= 5:
+            return JSONResponse({"ok": False, "reason": "max_attempts"}, status_code=400)
+            
+        if int(email_record["expires_ts"]) < now:
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+
+        if str(email_record["code"]) != code:
+            con.execute("UPDATE email_codes SET attempts=attempts+1 WHERE id=?", (email_record["id"],))
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+
+        con.execute("UPDATE email_codes SET used=1 WHERE id=?", (email_record["id"],))
+        con.execute("UPDATE users SET email_verified=1 WHERE id=?", (user_id,))
+        con.commit()
+
     token = create_session(tag)
 
     is_admin = False
-    with db() as con:
-        is_admin = _is_tag_admin(con, tag)
+    with db() as con2:
+        is_admin = _is_tag_admin(con2, tag)
 
     return JSONResponse(
         {
@@ -2851,6 +2865,62 @@ async def user_history(req: Request, tag: str = Depends(session_dep_ban_guard)):
     return JSONResponse({"ok": True, "history": results})
 
 
+@app.get("/api/user/stats")
+async def user_stats(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    target_tag = norm_tag(req.query_params.get("tag") or tag)
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT game_id, white_tag, black_tag, winner, reason, elo_change_white, elo_change_black, finished_ts
+            FROM game_results
+            WHERE white_tag=? OR black_tag=?
+            ORDER BY finished_ts DESC
+            """,
+            (target_tag, target_tag),
+        ).fetchall()
+        
+        total_games = len(rows)
+        wins = 0
+        win_streak = 0
+        streak_broken = False
+        
+        last_3 = []
+        for i, r in enumerate(rows):
+            is_white = r["white_tag"] == target_tag
+            you_won = (is_white and r["winner"] == "white") or (not is_white and r["winner"] == "black")
+            
+            if i < 3:
+                last_3.append({
+                    "game_id": r["game_id"],
+                    "white_tag": r["white_tag"],
+                    "black_tag": r["black_tag"],
+                    "winner": r["winner"],
+                    "reason": r["reason"],
+                    "elo_change_white": r["elo_change_white"],
+                    "elo_change_black": r["elo_change_black"],
+                    "finished_ts": r["finished_ts"]
+                })
+                
+            if you_won:
+                wins += 1
+                if not streak_broken:
+                    win_streak += 1
+            else:
+                streak_broken = True
+                
+        win_rate = int(round((wins / total_games * 100) if total_games > 0 else 0))
+        
+    return JSONResponse({
+        "ok": True, 
+        "stats": {
+            "win_rate": win_rate,
+            "win_streak": win_streak,
+            "total_games": total_games,
+            "last_3_matches": last_3
+        }
+    })
+
+
 @app.post("/api/social/friend_request")
 async def friend_request(req: Request, tag: str = Depends(session_dep_ban_guard)):
     body = await req.json()
@@ -3044,83 +3114,3 @@ async def ws_game(ws: WebSocket, gid: str):
         await game_hub.remove(gid, ws)
 
 
-# =========================================================
-# TELEGRAM WEBHOOK
-# =========================================================
-async def tg_send(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
-    if not BOT_TOKEN:
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload)
-
-
-@app.post("/webhook")
-async def telegram_webhook(req: Request):
-    if TELEGRAM_WEBHOOK_SECRET:
-        got = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not got or not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
-            return JSONResponse({"ok": False, "reason": "bad_webhook_secret"}, status_code=401)
-    data = await req.json()
-    message = data.get("message")
-    if not message:
-        return {"ok": True}
-
-    text = message.get("text", "")
-    chat = message.get("chat", {})
-    user = message.get("from", {})
-
-    tg_id = user.get("id")
-    tg_username = user.get("username")
-
-    if not tg_id:
-        return {"ok": True}
-
-    if not tg_username:
-        if str(text).startswith("/start"):
-            await tg_send(int(chat.get("id", tg_id)), "Сначала задай себе Telegram @username в настройках, потом снова нажми /start.")
-        return {"ok": True}
-
-    tag = norm_tag(str(tg_username))
-
-    with db() as con:
-        con.execute(
-            """
-            INSERT INTO tg_users(tag, tg_id, tg_username, created_ts)
-            VALUES (?,?,?,?)
-            ON CONFLICT(tag) DO UPDATE SET
-                tg_id=excluded.tg_id,
-                tg_username=excluded.tg_username
-            """,
-            (tag, tg_id, tg_username, now_ts()),
-        )
-        con.commit()
-
-    if str(text).startswith("/start"):
-        if WEBAPP_URL:
-            await tg_send(
-                int(chat.get("id", tg_id)),
-                "Бот подключён. Открывай игру кнопкой ниже.",
-                reply_markup={
-                    "inline_keyboard": [
-                        [
-                            {
-                                "text": "Открыть игру",
-                                "web_app": {"url": WEBAPP_URL},
-                            }
-                        ]
-                    ]
-                },
-            )
-        else:
-            await tg_send(int(chat.get("id", tg_id)), "Бот подключён. Теперь можешь авторизоваться в игре.")
-
-    return {"ok": True}
