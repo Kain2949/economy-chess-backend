@@ -370,6 +370,8 @@ def init_db() -> None:
 @app.on_event("startup")
 def _startup():
     init_db()
+    print(f"[STARTUP] SMTP_EMAIL configured: {bool(SMTP_EMAIL)}")
+    print(f"[STARTUP] SMTP_PASSWORD configured: {bool(SMTP_PASSWORD)}")
 
 
 # =========================================================
@@ -526,6 +528,7 @@ def generate_code() -> str:
     return f"{secrets.randbelow(1000000):06d}"
 
 def send_email_code(email: str, code: str) -> None:
+    print(f"[SMTP] Starting connection to smtp.gmail.com:587 for {email}...")
     try:
         msg = MIMEText(f"Economy Chess Login Code: {code}")
         msg["Subject"] = "Economy Chess Auth"
@@ -533,10 +536,22 @@ def send_email_code(email: str, code: str) -> None:
         msg["To"] = email
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
+            try:
+                server.login(SMTP_EMAIL, SMTP_PASSWORD)
+                print("[SMTP] Login successful.")
+            except Exception as e:
+                print(f"[SMTP] Login failed: {e}")
+                raise
+            
+            try:
+                server.send_message(msg)
+                print(f"[SMTP] Message sent successfully to {email}.")
+            except Exception as e:
+                print(f"[SMTP] Failed to send message: {e}")
+                raise
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        print(f"[SMTP] Overall email delivery failed: {e}")
+        raise e
 
 def get_latest_email_code(con: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
     return con.execute(
@@ -1246,9 +1261,11 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
         )
         con.commit()
 
-    import threading
-    t = threading.Thread(target=send_email_code, args=(email, code))
-    t.start()
+    # Temporarily disable background thread email sending. Send synchronously so delivery failures are visible.
+    try:
+        send_email_code(email, code)
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": "email_failed", "details": str(e)}, status_code=500)
 
     masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
     return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
