@@ -528,29 +528,61 @@ def generate_code() -> str:
     return f"{secrets.randbelow(1000000):06d}"
 
 def send_email_code(email: str, code: str) -> None:
-    print(f"[SMTP] Starting connection to smtp.gmail.com:587 for {email}...")
+    smtp_host = "smtp.gmail.com"
+    smtp_port = 587
+    email_set = bool(SMTP_EMAIL)
+    pass_set = bool(SMTP_PASSWORD)
+    
+    email_len = len(SMTP_EMAIL) if SMTP_EMAIL else 0
+    pass_len = len(SMTP_PASSWORD) if SMTP_PASSWORD else 0
+    # Strip whitespace to avoid common config mistakes
+    email_clean = SMTP_EMAIL.strip() if SMTP_EMAIL else ""
+    pass_clean = SMTP_PASSWORD.strip() if SMTP_PASSWORD else ""
+    
+    print(f"[SMTP DEBUG] Attempting to send to: {email}")
+    print(f"[SMTP DEBUG] Host: {smtp_host}, Port: {smtp_port}")
+    print(f"[SMTP DEBUG] SMTP_EMAIL is set: {email_set} (len: {email_len}, clean: '{email_clean}')")
+    print(f"[SMTP DEBUG] SMTP_PASSWORD is set: {pass_set} (len: {pass_len})")
+    
+    if not email_clean or not pass_clean:
+        err_msg = "Missing or empty SMTP credentials in environment."
+        print(f"[SMTP DEBUG] {err_msg}")
+        raise ValueError(err_msg)
+
+    print(f"[SMTP DEBUG] Starting connection to {smtp_host}:{smtp_port}...")
     try:
         msg = MIMEText(f"Economy Chess Login Code: {code}")
         msg["Subject"] = "Economy Chess Auth"
-        msg["From"] = SMTP_EMAIL
+        msg["From"] = email_clean
         msg["To"] = email
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        
+        print("[SMTP DEBUG] Connecting to SMTP server via smtplib...")
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+            server.set_debuglevel(1)  # Print low-level SMTP protocol steps globally to stdout
+            
+            print("[SMTP DEBUG] Sending EHLO/HELO and starting TLS...")
+            server.ehlo()
             server.starttls()
+            server.ehlo()
+            print("[SMTP DEBUG] TLS started successfully.")
+            
+            print("[SMTP DEBUG] Attempting login...")
             try:
-                server.login(SMTP_EMAIL, SMTP_PASSWORD)
-                print("[SMTP] Login successful.")
+                server.login(email_clean, pass_clean)
+                print("[SMTP DEBUG] Login successful.")
             except Exception as e:
-                print(f"[SMTP] Login failed: {e}")
+                print(f"[SMTP DEBUG] Login failed: {type(e).__name__} - {str(e)}")
                 raise
             
+            print("[SMTP DEBUG] Attempting to send message...")
             try:
                 server.send_message(msg)
-                print(f"[SMTP] Message sent successfully to {email}.")
+                print(f"[SMTP DEBUG] Message sent successfully to {email}.")
             except Exception as e:
-                print(f"[SMTP] Failed to send message: {e}")
+                print(f"[SMTP DEBUG] Failed to send message: {type(e).__name__} - {str(e)}")
                 raise
     except Exception as e:
-        print(f"[SMTP] Overall email delivery failed: {e}")
+        print(f"[SMTP DEBUG] Overall email delivery failed: {type(e).__name__} - {str(e)}")
         raise e
 
 def get_latest_email_code(con: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
@@ -1265,7 +1297,8 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
     try:
         send_email_code(email, code)
     except Exception as e:
-        return JSONResponse({"ok": False, "reason": "email_failed", "details": str(e)}, status_code=500)
+        err_str = f"{type(e).__name__}: {str(e)}"
+        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
 
     masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
     return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
