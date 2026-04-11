@@ -532,7 +532,7 @@ def generate_code() -> str:
 def send_email_code(email: str, code: str) -> bool:
     """Send verification code via Resend API. Never raises — returns True/False.
     Always logs the code to stdout so it's visible in Render logs as fallback."""
-    print(f"[EMAIL] Sending verification code to {email}, code: {code}")
+    print(f"[EMAIL CODE] {email} -> {code}", flush=True)
 
     if not RESEND_API_KEY:
         print("[EMAIL] RESEND_API_KEY not set — skipping send. Use code from logs.")
