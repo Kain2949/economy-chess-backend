@@ -8,8 +8,6 @@ import asyncio
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional, Set, List
 import bcrypt
-import smtplib
-from email.mime.text import MIMEText
 
 import chess
 import httpx
@@ -28,8 +26,8 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 INVITE_TTL_SECONDS = int(os.getenv("INVITE_TTL_SECONDS", "120"))
 CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "")
 
-SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM = os.getenv("RESEND_FROM", "Economy Chess <noreply@economychess.com>")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "e.vlasov2949@gmail.com")
 
 # =========================================================
@@ -373,8 +371,8 @@ def init_db() -> None:
 @app.on_event("startup")
 def _startup():
     init_db()
-    print(f"[STARTUP] SMTP_EMAIL configured: {bool(SMTP_EMAIL)}")
-    print(f"[STARTUP] SMTP_PASSWORD configured: {bool(SMTP_PASSWORD)}")
+    print(f"[STARTUP] RESEND_API_KEY configured: {bool(RESEND_API_KEY)}")
+    print(f"[STARTUP] RESEND_FROM: {RESEND_FROM}")
 
 
 # =========================================================
@@ -531,63 +529,49 @@ def verify_password(password: str, hashed: str) -> bool:
 def generate_code() -> str:
     return f"{secrets.randbelow(1000000):06d}"
 
-def send_email_code(email: str, code: str) -> None:
-    smtp_host = "smtp.gmail.com"
-    smtp_port = 587
-    email_set = bool(SMTP_EMAIL)
-    pass_set = bool(SMTP_PASSWORD)
-    
-    email_len = len(SMTP_EMAIL) if SMTP_EMAIL else 0
-    pass_len = len(SMTP_PASSWORD) if SMTP_PASSWORD else 0
-    # Strip whitespace to avoid common config mistakes
-    email_clean = SMTP_EMAIL.strip() if SMTP_EMAIL else ""
-    pass_clean = SMTP_PASSWORD.strip() if SMTP_PASSWORD else ""
-    
-    print(f"[SMTP DEBUG] Attempting to send to: {email}")
-    print(f"[SMTP DEBUG] Host: {smtp_host}, Port: {smtp_port}")
-    print(f"[SMTP DEBUG] SMTP_EMAIL is set: {email_set} (len: {email_len}, clean: '{email_clean}')")
-    print(f"[SMTP DEBUG] SMTP_PASSWORD is set: {pass_set} (len: {pass_len})")
-    
-    if not email_clean or not pass_clean:
-        err_msg = "Missing or empty SMTP credentials in environment."
-        print(f"[SMTP DEBUG] {err_msg}")
-        raise ValueError(err_msg)
+def send_email_code(email: str, code: str) -> bool:
+    """Send verification code via Resend API. Never raises — returns True/False.
+    Always logs the code to stdout so it's visible in Render logs as fallback."""
+    print(f"[EMAIL] Sending verification code to {email}, code: {code}")
 
-    print(f"[SMTP DEBUG] Starting connection to {smtp_host}:{smtp_port}...")
+    if not RESEND_API_KEY:
+        print("[EMAIL] RESEND_API_KEY not set — skipping send. Use code from logs.")
+        return False
+
+    html_body = (
+        f'<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">'
+        f'<h2 style="margin:0 0 16px">Economy Chess</h2>'
+        f'<p>Your verification code:</p>'
+        f'<div style="font-size:32px;letter-spacing:8px;font-weight:bold;'
+        f'background:#f4f4f4;padding:16px;text-align:center;border-radius:8px">{code}</div>'
+        f'<p style="color:#888;margin-top:16px">Code expires in 10 minutes.</p>'
+        f'</div>'
+    )
+
     try:
-        msg = MIMEText(f"Economy Chess Login Code: {code}")
-        msg["Subject"] = "Economy Chess Auth"
-        msg["From"] = email_clean
-        msg["To"] = email
-        
-        print("[SMTP DEBUG] Connecting to SMTP server via smtplib...")
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-            server.set_debuglevel(1)  # Print low-level SMTP protocol steps globally to stdout
-            
-            print("[SMTP DEBUG] Sending EHLO/HELO and starting TLS...")
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            print("[SMTP DEBUG] TLS started successfully.")
-            
-            print("[SMTP DEBUG] Attempting login...")
-            try:
-                server.login(email_clean, pass_clean)
-                print("[SMTP DEBUG] Login successful.")
-            except Exception as e:
-                print(f"[SMTP DEBUG] Login failed: {type(e).__name__} - {str(e)}")
-                raise
-            
-            print("[SMTP DEBUG] Attempting to send message...")
-            try:
-                server.send_message(msg)
-                print(f"[SMTP DEBUG] Message sent successfully to {email}.")
-            except Exception as e:
-                print(f"[SMTP DEBUG] Failed to send message: {type(e).__name__} - {str(e)}")
-                raise
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM,
+                "to": [email],
+                "subject": "Verification Code",
+                "html": html_body,
+            },
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            print(f"[EMAIL] Sent OK to {email} (status {resp.status_code})")
+            return True
+        else:
+            print(f"[EMAIL] Resend API error: {resp.status_code} — {resp.text}")
+            return False
     except Exception as e:
-        print(f"[SMTP DEBUG] Overall email delivery failed: {type(e).__name__} - {str(e)}")
-        raise e
+        print(f"[EMAIL] FAILED for {email}, code: {code} — {type(e).__name__}: {e}")
+        return False
 
 def get_latest_email_code(con: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
     return con.execute(
@@ -1265,12 +1249,8 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
 
         con.commit()
 
-    # Send verification email
-    try:
-        send_email_code(email, code)
-    except Exception as e:
-        err_str = f"{type(e).__name__}: {str(e)}"
-        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
+    # Send verification email (fail-safe: never blocks registration)
+    send_email_code(email, code)
 
     masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
     return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
@@ -1411,11 +1391,8 @@ async def auth_resend_code(req: Request, _: None = Depends(api_key_dep)):
         )
         con.commit()
 
-    try:
-        send_email_code(email, code)
-    except Exception as e:
-        err_str = f"{type(e).__name__}: {str(e)}"
-        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
+    # Fail-safe: never return 500 for email issues
+    send_email_code(email, code)
 
     return JSONResponse({"ok": True, "status": "code_sent"})
 
