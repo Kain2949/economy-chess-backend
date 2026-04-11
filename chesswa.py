@@ -338,6 +338,9 @@ def init_db() -> None:
 
         ensure_column(con, "users", "elo", "INTEGER NOT NULL DEFAULT 100")
         ensure_column(con, "users", "games_played", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "users", "email", "TEXT")
+        ensure_column(con, "users", "password_hash", "TEXT")
+        ensure_column(con, "users", "email_verified", "INTEGER DEFAULT 0")
         ensure_column(con, "games", "draw_offer_by", "TEXT NOT NULL DEFAULT ''")
         ensure_column(con, "games", "rematch_offer_by", "TEXT NOT NULL DEFAULT ''")
         ensure_column(con, "games", "last_move_from", "TEXT NOT NULL DEFAULT ''")
@@ -509,10 +512,11 @@ def get_user(tag: str) -> Optional[sqlite3.Row]:
         return con.execute("SELECT * FROM users WHERE tag=?", (tag,)).fetchone()
 
 
-def has_tg_user(tag: str) -> bool:
-    with db() as con:
-        row = con.execute("SELECT tag FROM tg_users WHERE tag=?", (tag,)).fetchone()
-    return bool(row)
+def _get_user_info(con: sqlite3.Connection, tag: str) -> Optional[Dict[str, Any]]:
+    row = con.execute("SELECT tag, nickname, elo FROM users WHERE tag=?", (tag,)).fetchone()
+    if not row:
+        return None
+    return {"tag": str(row["tag"]), "nickname": str(row["nickname"]), "elo": int(row["elo"] or 0)}
 
 
 def hash_password(password: str) -> str:
@@ -682,9 +686,8 @@ def load_game_row(con: sqlite3.Connection, gid: str) -> Optional[sqlite3.Row]:
 def get_user_public(tag: str) -> Dict[str, Any]:
     user = get_user(tag)
     is_admin = False
-    if ADMIN_TG_ID_INT is not None:
-        with db() as con:
-            is_admin = _is_tag_admin(con, tag)
+    with db() as con:
+        is_admin = _is_tag_admin(con, tag)
     admin_label = "admin" if is_admin else ""
     if not user:
         return {"tag": tag, "nickname": tag, "elo": 0, "is_admin": is_admin, "admin": admin_label}
@@ -697,7 +700,9 @@ def get_user_public(tag: str) -> Dict[str, Any]:
     }
 
 
-def row_to_game(row: sqlite3.Row, viewer_tag: str) -> Dict[str, Any]:
+def row_to_game(row, viewer_tag: str) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        row = dict(row)
     you = "w" if row["w_tag"] == viewer_tag else ("b" if row["b_tag"] == viewer_tag else "")
     w_user = get_user_public(str(row["w_tag"]))
     b_user = get_user_public(str(row["b_tag"]))
@@ -1104,6 +1109,9 @@ class LobbyHub:
                 del self.conns[tag]
         await self.broadcast_online()
 
+    def is_online(self, tag: str) -> bool:
+        return tag in self.conns and len(self.conns[tag]) > 0
+
     async def send_to(self, tag: str, payload: Dict[str, Any]):
         async with self.lock:
             sockets = list(self.conns.get(tag, set()))
@@ -1232,21 +1240,40 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
         
         # Safe debug autoban (server-side env flag only).
         if DEBUG_BAN_WOMEN_ON_REGISTER and gender == "f":
-            now = now_ts()
-            expires_ts = now + int(DEBUG_BAN_WOMEN_SECONDS)
-            reason = "debug_autoban_women_10y"
+            _now = now_ts()
+            _exp = _now + int(DEBUG_BAN_WOMEN_SECONDS)
+            _reason = "debug_autoban_women_10y"
             con.execute(
                 """
                 INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag)
                 VALUES (?,?,?,?,?,?)
                 """,
-                (tag_candidate, reason, now, expires_ts, None, None),
+                (tag_candidate, _reason, _now, _exp, None, None),
             )
             con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag_candidate,))
-            
+
+        # Generate and save verification code
+        user_row = con.execute("SELECT id FROM users WHERE tag=?", (tag_candidate,)).fetchone()
+        user_id = int(user_row["id"])
+        now_reg = now_ts()
+        code = generate_code()
+        code_exp = now_reg + 10 * 60
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (user_id, code, now_reg, code_exp)
+        )
+
         con.commit()
 
-    return JSONResponse({"ok": True})
+    # Send verification email
+    try:
+        send_email_code(email, code)
+    except Exception as e:
+        err_str = f"{type(e).__name__}: {str(e)}"
+        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
+
+    masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
+    return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
 
 @app.post("/api/auth/login")
 async def auth_login(req: Request, _: None = Depends(api_key_dep)):
@@ -1258,50 +1285,35 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
         return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
 
     with db() as con:
-        user = con.execute("SELECT id, email, password_hash FROM users WHERE email=? OR tag=? OR nickname=?", (identifier, identifier, identifier)).fetchone()
+        user = con.execute(
+            "SELECT id, tag, email, password_hash, email_verified, nickname, elo, skill FROM users WHERE email=? OR tag=? OR nickname=?",
+            (identifier, identifier, identifier),
+        ).fetchone()
         if not user:
             return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
 
         if not verify_password(password, str(user["password_hash"])):
             return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
-        
-        user_id = int(user["id"])
-        email = str(user["email"])
-        now = now_ts()
 
-        recent_reqs = con.execute(
-            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
-            (user_id, now - 600)
-        ).fetchone()
-        if recent_reqs and recent_reqs["c"] >= 5:
-            return JSONResponse({"ok": False, "reason": "rate_limit"}, status_code=429)
+        if not int(user["email_verified"] or 0):
+            return JSONResponse({"ok": False, "reason": "email_not_verified"}, status_code=403)
 
-        recent_fast = con.execute(
-            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
-             (user_id, now - 30)
-        ).fetchone()
-        if recent_fast and recent_fast["c"] > 0:
-            return JSONResponse({"ok": False, "reason": "rate_limit_30s"}, status_code=429)
+        tag = str(user["tag"])
+        is_admin = _is_tag_admin(con, tag)
 
-        con.execute("UPDATE email_codes SET used=1 WHERE user_id=?", (user_id,))
-        
-        code = generate_code()
-        exp = now + 10 * 60
-        con.execute(
-            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
-            (user_id, code, now, exp)
-        )
-        con.commit()
+    token = create_session(tag)
 
-    # Temporarily disable background thread email sending. Send synchronously so delivery failures are visible.
-    try:
-        send_email_code(email, code)
-    except Exception as e:
-        err_str = f"{type(e).__name__}: {str(e)}"
-        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
-
-    masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
-    return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
+    return JSONResponse({
+        "ok": True,
+        "token": token,
+        "user": {
+            "tag": tag,
+            "nickname": str(user["nickname"]),
+            "elo": int(user["elo"] or 0),
+            "skill": int(user["skill"] or 0),
+            "is_admin": bool(is_admin),
+        },
+    })
 
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
@@ -1360,6 +1372,52 @@ async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
             },
         }
     )
+
+
+# =========================================================
+# Resend verification code
+# =========================================================
+@app.post("/api/auth/resend-code")
+async def auth_resend_code(req: Request, _: None = Depends(api_key_dep)):
+    body = await req.json()
+    email = (body.get("email") or "").strip().lower()
+
+    if not email:
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    with db() as con:
+        user = con.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+        if int(user["email_verified"] or 0):
+            return JSONResponse({"ok": False, "reason": "already_verified"}, status_code=400)
+
+        user_id = int(user["id"])
+        now = now_ts()
+
+        recent = con.execute(
+            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
+            (user_id, now - 60)
+        ).fetchone()
+        if recent and recent["c"] > 0:
+            return JSONResponse({"ok": False, "reason": "rate_limit"}, status_code=429)
+
+        con.execute("UPDATE email_codes SET used=1 WHERE user_id=?", (user_id,))
+        code = generate_code()
+        exp = now + 10 * 60
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (user_id, code, now, exp)
+        )
+        con.commit()
+
+    try:
+        send_email_code(email, code)
+    except Exception as e:
+        err_str = f"{type(e).__name__}: {str(e)}"
+        return JSONResponse({"ok": False, "reason": "email_failed", "details": err_str}, status_code=500)
+
+    return JSONResponse({"ok": True, "status": "code_sent"})
 
 
 # =========================================================
@@ -1426,9 +1484,9 @@ async def support_ticket_create(req: Request, tag: str = Depends(session_dep)):
         con.commit()
 
     # Notify admin via lobby WS
-    if ADMIN_TG_ID_INT is not None:
+    if ADMIN_EMAIL:
         with db() as con2:
-            admin_row = con2.execute("SELECT tag FROM tg_users WHERE tg_id=?", (ADMIN_TG_ID_INT,)).fetchone()
+            admin_row = con2.execute("SELECT tag FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
         if admin_row:
             await lobby_hub.send_to(str(admin_row["tag"]), {
                 "type": "support_new_ticket",
@@ -1469,9 +1527,9 @@ async def support_ticket_reply(req: Request, tag: str = Depends(session_dep)):
         con.commit()
 
     # Notify admin via lobby WS
-    if ADMIN_TG_ID_INT is not None:
+    if ADMIN_EMAIL:
         with db() as con2:
-            admin_row = con2.execute("SELECT tag FROM tg_users WHERE tg_id=?", (ADMIN_TG_ID_INT,)).fetchone()
+            admin_row = con2.execute("SELECT tag FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
         if admin_row:
             await lobby_hub.send_to(str(admin_row["tag"]), {
                 "type": "support_new_message",
@@ -1640,9 +1698,6 @@ async def admin_ban_quick(req: Request, admin_tag: str = Depends(admin_only_dep)
         if not user:
             return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
 
-        admin_tg_id = con.execute("SELECT tg_id FROM tg_users WHERE tag=?", (admin_tag,)).fetchone()
-        created_by_tg_id = int(admin_tg_id["tg_id"]) if admin_tg_id else int(ADMIN_TG_ID_INT or 0)
-
         # Revoke existing active bans for this tag.
         con.execute(
             """
@@ -1657,10 +1712,10 @@ async def admin_ban_quick(req: Request, admin_tag: str = Depends(admin_only_dep)
 
         con.execute(
             """
-            INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag, created_by_tg_id)
-            VALUES (?,?,?,?,?,?,?)
+            INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag)
+            VALUES (?,?,?,?,?,?)
             """,
-            (tag, reason, now, int(expires_ts), None, admin_tag, created_by_tg_id),
+            (tag, reason, now, int(expires_ts), None, admin_tag),
         )
         con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag,))
         con.commit()
@@ -3018,15 +3073,9 @@ async def friend_accept(req: Request, tag: str = Depends(session_dep_ban_guard))
             
         con.execute("UPDATE friends SET status='accepted' WHERE tag_a=? AND tag_b=?", (tag_a, tag_b))
         con.commit()
-        
-        # Broadcast online status to both users to update UI immediately
-        user_a = _get_user_info(con, tag_a)
-        user_b = _get_user_info(con, tag_b)
-        
-        if user_a and lobby_hub.is_online(tag_a):
-            from .chesswa import lobby_hub # Need to refer to global instance
-            import asyncio
-            asyncio.create_task(lobby_hub.broadcast_online())
+
+    # Broadcast online update after friend accepted
+    asyncio.create_task(lobby_hub.broadcast_online())
     return JSONResponse({"ok": True})
 
 
@@ -3066,9 +3115,10 @@ async def friend_list(req: Request, tag: str = Depends(session_dep_ban_guard)):
 async def game_report(req: Request, tag: str = Depends(session_dep_ban_guard)):
     gid = (req.query_params.get("game_id") or "").strip()
     with db() as con:
-        row = load_game_row(con, gid)
-        if not row:
+        row_db = load_game_row(con, gid)
+        if not row_db:
             return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        row = dict(row_db)
             
         res = {
             "game_id": row["game_id"],
