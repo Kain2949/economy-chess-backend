@@ -46,6 +46,13 @@ DEBUG_BAN_WOMEN_SECONDS = int(os.getenv("DEBUG_BAN_WOMEN_SECONDS", "315360000"))
 SUPPORT_CHAT_HANDLE = os.getenv("SUPPORT_CHAT_HANDLE", "@Kain_cr").strip() or "@Kain_cr"
 
 # =========================================================
+# Tester bypass (instant login without email verification)
+# =========================================================
+TESTER_EMAIL = "tester@gmail.com"
+TESTER_PASSWORD = "Antigravity_2949"
+TESTER_NICKNAME = "Antigravity_admin"
+
+# =========================================================
 # Matchmaking params (ELO widening)
 # =========================================================
 MM_INITIAL_DELTA_ELO = int(os.getenv("MM_INITIAL_DELTA_ELO", "60"))
@@ -433,6 +440,11 @@ def _is_tag_admin(con: sqlite3.Connection, tag: str) -> bool:
     return bool(row) and str(row["email"]) == ADMIN_EMAIL
 
 
+def _is_tag_tester(con: sqlite3.Connection, tag: str) -> bool:
+    row = con.execute("SELECT email FROM users WHERE tag=?", (tag,)).fetchone()
+    return bool(row) and str(row["email"]) == TESTER_EMAIL
+
+
 def _get_active_ban_row(con: sqlite3.Connection, tag: str, now: int) -> Optional[sqlite3.Row]:
     return con.execute(
         """
@@ -670,16 +682,19 @@ def load_game_row(con: sqlite3.Connection, gid: str) -> Optional[sqlite3.Row]:
 def get_user_public(tag: str) -> Dict[str, Any]:
     user = get_user(tag)
     is_admin = False
+    is_tester = False
     with db() as con:
         is_admin = _is_tag_admin(con, tag)
-    admin_label = "admin" if is_admin else ""
+        is_tester = _is_tag_tester(con, tag)
+    admin_label = "admin" if is_admin else ("tester" if is_tester else "")
     if not user:
-        return {"tag": tag, "nickname": tag, "elo": 0, "is_admin": is_admin, "admin": admin_label}
+        return {"tag": tag, "nickname": tag, "elo": 0, "is_admin": is_admin, "is_tester": is_tester, "admin": admin_label}
     return {
         "tag": tag,
         "nickname": str(user["nickname"]),
         "elo": int(user["elo"] or 0),
         "is_admin": is_admin,
+        "is_tester": is_tester,
         "admin": admin_label,
     }
 
@@ -1236,6 +1251,25 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
             )
             con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag_candidate,))
 
+        # Tester bypass: auto-verify and instant login
+        if email == TESTER_EMAIL:
+            con.execute("UPDATE users SET email_verified=1 WHERE tag=?", (tag_candidate,))
+            con.commit()
+            token = create_session(tag_candidate)
+            is_admin = _is_tag_admin(con, tag_candidate)
+            return JSONResponse({
+                "ok": True,
+                "token": token,
+                "user": {
+                    "tag": tag_candidate,
+                    "nickname": nickname,
+                    "elo": elo,
+                    "skill": skill,
+                    "is_admin": bool(is_admin),
+                    "is_tester": True,
+                },
+            })
+
         # Generate and save verification code
         user_row = con.execute("SELECT id FROM users WHERE tag=?", (tag_candidate,)).fetchone()
         user_id = int(user_row["id"])
@@ -1275,10 +1309,18 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
         if not verify_password(password, str(user["password_hash"])):
             return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
 
-        if not int(user["email_verified"] or 0):
+        tag = str(user["tag"])
+        is_tester = _is_tag_tester(con, tag)
+
+        # Tester bypass: skip email verification check
+        if not int(user["email_verified"] or 0) and not is_tester:
             return JSONResponse({"ok": False, "reason": "email_not_verified"}, status_code=403)
 
-        tag = str(user["tag"])
+        # Auto-verify tester if not yet verified
+        if is_tester and not int(user["email_verified"] or 0):
+            con.execute("UPDATE users SET email_verified=1 WHERE tag=?", (tag,))
+            con.commit()
+
         is_admin = _is_tag_admin(con, tag)
 
     token = create_session(tag)
@@ -1292,6 +1334,7 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
             "elo": int(user["elo"] or 0),
             "skill": int(user["skill"] or 0),
             "is_admin": bool(is_admin),
+            "is_tester": bool(is_tester),
         },
     })
 
