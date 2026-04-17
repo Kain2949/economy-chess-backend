@@ -1199,8 +1199,10 @@ game_hub = GameHub()
 # =========================================================
 @app.post("/api/auth/register")
 async def register(req: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/register")
     body = await req.json()
     email = (body.get("email") or "").strip().lower()
+    print(f"[BACKEND auth] Payload email: '{email}'")
     password = body.get("password", "")
     password_confirm = body.get("password_confirm", "")
     nickname = (body.get("nickname") or "").strip()
@@ -1208,12 +1210,16 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
     skill = int(body.get("skill") or 0)
 
     if not email or "@" not in email:
+        print("[BACKEND auth] Error: bad_email")
         return JSONResponse({"ok": False, "reason": "bad_email"}, status_code=400)
     if len(password) < 8 or not any(c.isdigit() for c in password):
+        print("[BACKEND auth] Error: bad_password (validation)")
         return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
     if password != password_confirm:
+        print("[BACKEND auth] Error: password_mismatch")
         return JSONResponse({"ok": False, "reason": "password_mismatch"}, status_code=400)
     if not nickname or gender not in ("m", "f") or skill not in SKILL_TO_ELO:
+        print("[BACKEND auth] Error: bad_fields (nickname, gender, skill missing or invalid)")
         return JSONResponse({"ok": False, "reason": "bad_fields"}, status_code=400)
 
     import random
@@ -1221,6 +1227,7 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
     
     with db() as con:
         if con.execute("SELECT email FROM users WHERE email=?", (email,)).fetchone():
+            print("[BACKEND auth] Error: email_taken")
             return JSONResponse({"ok": False, "reason": "email_taken"}, status_code=400)
         
         while con.execute("SELECT tag FROM users WHERE tag=?", (tag_candidate,)).fetchone():
@@ -1253,6 +1260,7 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
 
         # Tester bypass: auto-verify and instant login
         if email == TESTER_EMAIL:
+            print("[BACKEND auth] Tester email used, bypassing verification")
             con.execute("UPDATE users SET email_verified=1 WHERE tag=?", (tag_candidate,))
             con.commit()
             token = create_session(tag_candidate)
@@ -1270,6 +1278,9 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
                 },
             })
 
+        print(f"[BACKEND auth] DB insert success for tag: {tag_candidate}")
+
+
         # Generate and save verification code
         user_row = con.execute("SELECT id FROM users WHERE tag=?", (tag_candidate,)).fetchone()
         user_id = int(user_row["id"])
@@ -1284,18 +1295,23 @@ async def register(req: Request, _: None = Depends(api_key_dep)):
         con.commit()
 
     # Send verification email (fail-safe: never blocks registration)
+    print(f"[BACKEND auth] Prepared code {code} for user {user_id}. Attempting to send email...")
     send_email_code(email, code)
 
     masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
+    print(f"[BACKEND auth] Done. Sent 200 OK, code_sent response.")
     return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
 
 @app.post("/api/auth/login")
 async def auth_login(req: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/login")
     body = await req.json()
     identifier = (body.get("identifier") or "").strip().lower()
+    print(f"[BACKEND auth] Payload identifier: '{identifier}'")
     password = body.get("password", "")
 
     if not identifier or not password:
+        print("[BACKEND auth] Error: bad_input (empty string)")
         return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
 
     with db() as con:
@@ -1304,16 +1320,20 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
             (identifier, identifier, identifier),
         ).fetchone()
         if not user:
+            print(f"[BACKEND auth] Error: not_found (identifier {identifier} not in DB)")
             return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
 
         if not verify_password(password, str(user["password_hash"])):
+            print(f"[BACKEND auth] Error: bad_password for user {user['tag']}")
             return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
 
         tag = str(user["tag"])
         is_tester = _is_tag_tester(con, tag)
+        print(f"[BACKEND auth] Found user: tag={tag}, email_verified={user['email_verified']}, tester={is_tester}")
 
         # Tester bypass: skip email verification check
         if not int(user["email_verified"] or 0) and not is_tester:
+            print("[BACKEND auth] Error: email_not_verified")
             return JSONResponse({"ok": False, "reason": "email_not_verified"}, status_code=403)
 
         # Auto-verify tester if not yet verified
@@ -1323,8 +1343,10 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
 
         is_admin = _is_tag_admin(con, tag)
 
+    print(f"[BACKEND auth] Creating session token for {tag}")
     token = create_session(tag)
 
+    print(f"[BACKEND auth] Login success, returning 200 OK")
     return JSONResponse({
         "ok": True,
         "token": token,
@@ -1340,17 +1362,21 @@ async def auth_login(req: Request, _: None = Depends(api_key_dep)):
 
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/verify-code")
     body = await req.json()
     email = (body.get("email") or "").strip().lower()
     code = (body.get("code") or "").strip()
+    print(f"[BACKEND auth] Payload email: '{email}', code length: {len(code)}")
 
     if not email or not code:
+        print("[BACKEND auth] Error: bad_input (empty string)")
         return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
 
     now = now_ts()
     with db() as con:
         user = con.execute("SELECT id, tag, nickname, elo, skill FROM users WHERE email=?", (email,)).fetchone()
         if not user:
+            print(f"[BACKEND auth] Error: not_found (email {email} not in DB)")
             return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
             
         user_id = int(user["id"])
@@ -1358,20 +1384,25 @@ async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
 
         email_record = get_latest_email_code(con, user_id)
         if not email_record:
+            print(f"[BACKEND auth] Error: bad_code (no un-used code found for user_id={user_id})")
             return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
             
         attempts = int(email_record["attempts"])
         if attempts >= 5:
+            print(f"[BACKEND auth] Error: max_attempts (code attempted {attempts} times)")
             return JSONResponse({"ok": False, "reason": "max_attempts"}, status_code=400)
             
         if int(email_record["expires_ts"]) < now:
+            print(f"[BACKEND auth] Error: bad_code (code expired at {email_record['expires_ts']})")
             return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
 
         if str(email_record["code"]) != code:
+            print(f"[BACKEND auth] Error: bad_code (mismatch, attempts={attempts+1})")
             con.execute("UPDATE email_codes SET attempts=attempts+1 WHERE id=?", (email_record["id"],))
             con.commit()
             return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
 
+        print("[BACKEND auth] Code matched! Verifying user email...")
         con.execute("UPDATE email_codes SET used=1 WHERE id=?", (email_record["id"],))
         con.execute("UPDATE users SET email_verified=1 WHERE id=?", (user_id,))
         con.commit()
@@ -1402,17 +1433,22 @@ async def auth_verify_code(req: Request, _: None = Depends(api_key_dep)):
 # =========================================================
 @app.post("/api/auth/resend-code")
 async def auth_resend_code(req: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/resend-code")
     body = await req.json()
     email = (body.get("email") or "").strip().lower()
+    print(f"[BACKEND auth] Payload email: '{email}'")
 
     if not email:
+        print("[BACKEND auth] Error: bad_input (empty string)")
         return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
 
     with db() as con:
         user = con.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
         if not user:
+            print(f"[BACKEND auth] Error: not_found")
             return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
         if int(user["email_verified"] or 0):
+            print(f"[BACKEND auth] Error: already_verified")
             return JSONResponse({"ok": False, "reason": "already_verified"}, status_code=400)
 
         user_id = int(user["id"])
@@ -1423,6 +1459,7 @@ async def auth_resend_code(req: Request, _: None = Depends(api_key_dep)):
             (user_id, now - 60)
         ).fetchone()
         if recent and recent["c"] > 0:
+            print(f"[BACKEND auth] Error: rate_limit (recently created a code for user_id={user_id})")
             return JSONResponse({"ok": False, "reason": "rate_limit"}, status_code=429)
 
         con.execute("UPDATE email_codes SET used=1 WHERE user_id=?", (user_id,))
