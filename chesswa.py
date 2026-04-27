@@ -1,0 +1,3778 @@
+import os
+import json
+import time
+import hmac
+import secrets
+import sqlite3
+import asyncio
+import re
+import random
+from urllib.parse import urlparse
+from typing import Any, Dict, Optional, Set, List
+import bcrypt
+import smtplib
+from email.message import EmailMessage
+
+# PostgreSQL support
+try:
+    import psycopg2
+    from psycopg2 import pool
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+
+import chess
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, Header, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+import logging
+
+# =========================================================
+# LOGGING
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("chesswa")
+
+# =========================================================
+# ENV
+# =========================================================
+WEB_SECRET_KEY = os.getenv("WEB_SECRET_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_PATH = os.getenv("DB_PATH", "./database.db")
+HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8000"))
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+INVITE_TTL_SECONDS = int(os.getenv("INVITE_TTL_SECONDS", "120"))
+CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "")
+
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "e.vlasov2949@gmail.com")
+
+# =========================================================
+# Admin / Ban debug (MVP)
+# =========================================================
+
+# Safe test mechanism: if enabled, user registering with gender "f" gets a 10-year ban.
+DEBUG_BAN_WOMEN_ON_REGISTER = (os.getenv("DEBUG_BAN_WOMEN_ON_REGISTER", "") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+DEBUG_BAN_WOMEN_SECONDS = int(os.getenv("DEBUG_BAN_WOMEN_SECONDS", "315360000"))  # 10 years
+SUPPORT_CHAT_HANDLE = os.getenv("SUPPORT_CHAT_HANDLE", "@Kain_cr").strip() or "@Kain_cr"
+
+# =========================================================
+# Tester bypass (instant login without email verification)
+# =========================================================
+TESTER_EMAIL = "tester@gmail.com"
+TESTER_PASSWORD = "Antigravity_2949"
+TESTER_NICKNAME = "Antigravity_admin"
+
+# =========================================================
+# Matchmaking params (ELO widening)
+# =========================================================
+MM_INITIAL_DELTA_ELO = int(os.getenv("MM_INITIAL_DELTA_ELO", "60"))
+MM_STEP_SECONDS = int(os.getenv("MM_STEP_SECONDS", "20"))
+MM_STEP_DELTA_ELO = int(os.getenv("MM_STEP_DELTA_ELO", "20"))
+MM_MAX_DELTA_ELO = int(os.getenv("MM_MAX_DELTA_ELO", "300"))
+MM_QUEUE_TIMEOUT_SECONDS = int(os.getenv("MM_QUEUE_TIMEOUT_SECONDS", "900"))
+
+if not WEB_SECRET_KEY:
+    WEB_SECRET_KEY = secrets.token_hex(32)
+    logger.warning("WEB_SECRET_KEY not set — generated ephemeral key. Set it in env for production!")
+
+# ELO update constants
+ELO_K_DEFAULT = 32
+ELO_K_PROVISIONAL = 40
+ELO_PROVISIONAL_GAMES = 20
+
+SKILL_TO_ELO = {
+    1: 100,
+    2: 400,
+    3: 800,
+    4: 1200,
+    5: 1600,
+}
+
+# =========================================================
+# FastAPI
+# =========================================================
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+
+def _origin_from_url(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def _cors_allowed_origins() -> List[str]:
+    origins: List[str] = [
+        "https://kain2949.github.io",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    for chunk in CORS_ALLOW_ORIGINS_RAW.split(","):
+        origin = _origin_from_url(chunk)
+        if origin:
+            origins.append(origin)
+    webapp_origin = _origin_from_url(WEBAPP_URL)
+    if webapp_origin:
+        origins.append(webapp_origin)
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for origin in origins:
+        if origin in seen:
+            continue
+        seen.add(origin)
+        deduped.append(origin)
+    return deduped
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        payload = {"ok": False, **detail}
+    else:
+        payload = {"ok": False, "reason": str(detail)}
+    return JSONResponse(payload, status_code=exc.status_code)
+
+
+# =========================================================
+# DB helpers
+# =========================================================
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+# =========================================================
+# DATABASE CONNECTION (PostgreSQL/SQLite)
+# =========================================================
+_postgres_pool = None
+_use_postgres = False
+
+def init_database_pool():
+    global _postgres_pool, _use_postgres
+    if DATABASE_URL:
+        try:
+            import psycopg2
+            from psycopg2 import pool
+            from psycopg2.extras import DictCursor
+            _postgres_pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                dsn=DATABASE_URL,
+                cursor_factory=DictCursor
+            )
+            _use_postgres = True
+            logger.info("Using PostgreSQL database")
+        except Exception as e:
+            logger.warning(f"Failed to connect to PostgreSQL: {e}, falling back to SQLite")
+            _use_postgres = False
+    else:
+        _use_postgres = False
+        logger.info("Using SQLite database")
+
+def _returning_id() -> str:
+    return "RETURNING id"
+
+class PostgresConnectionAdapter:
+    """Adapter to make psycopg2 connection behave like sqlite3 connection"""
+    def __init__(self, conn):
+        self._conn = conn
+        self._cursor = None
+        
+    def cursor(self):
+        if self._cursor is None:
+            self._cursor = self._conn.cursor()
+        return self._cursor
+    
+    def _convert_placeholders(self, query):
+        """Convert SQLite style ? placeholders to PostgreSQL %s and handle common SQLite-isms"""
+        query = query.replace('?', '%s')
+        # Remove COLLATE NOCASE as PostgreSQL uses ILIKE or LOWER() for case-insensitivity
+        import re
+        query = re.sub(r'COLLATE\s+NOCASE', '', query, flags=re.IGNORECASE)
+        return query
+    
+    def execute(self, query, params=None):
+        cursor = self.cursor()
+        query = self._convert_placeholders(query)
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return PostgresCursorAdapter(cursor)
+    
+    def executemany(self, query, params_list):
+        cursor = self.cursor()
+        query = self._convert_placeholders(query)
+        cursor.executemany(query, params_list)
+        return PostgresCursorAdapter(cursor)
+    
+    def commit(self):
+        self._conn.commit()
+    
+    def rollback(self):
+        self._conn.rollback()
+    
+    def close(self):
+        if self._cursor:
+            self._cursor.close()
+        self._conn.close()
+
+class PostgresCursorAdapter:
+    """Adapter to make psycopg2 cursor behave like sqlite3 cursor"""
+    def __init__(self, cursor):
+        self._cursor = cursor
+        
+    def fetchone(self):
+        # DictCursor returns objects that support both row["id"] and row[0]
+        return self._cursor.fetchone()
+    
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def lastrowid(self):
+        # Note: In PostgreSQL we use RETURNING id and fetch it manually
+        return None
+
+class DatabaseConnection:
+    def __init__(self):
+        self.conn = None
+        self.is_postgres = _use_postgres
+        
+    def __enter__(self):
+        if self.is_postgres and _postgres_pool:
+            raw_conn = _postgres_pool.getconn()
+            raw_conn.autocommit = False
+            self.conn = PostgresConnectionAdapter(raw_conn)
+        else:
+            self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            
+            if self.is_postgres and _postgres_pool:
+                # For PostgreSQL, close the adapter which will close the connection
+                self.conn.close()
+            else:
+                self.conn.close()
+
+def db():
+    return DatabaseConnection()
+
+def has_column(con, table: str, column: str) -> bool:
+    if _use_postgres:
+        cursor = con.cursor()
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = %s AND column_name = %s
+        """, (table, column))
+        return cursor.fetchone() is not None
+    else:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(r["name"]) == column for r in rows)
+
+def ensure_column(con, table: str, column: str, ddl: str) -> None:
+    if not has_column(con, table, column):
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def init_db() -> None:
+    with db() as con:
+        # PostgreSQL uses SERIAL instead of AUTOINCREMENT
+        id_type = "SERIAL" if _use_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS users (
+                id {id_type},
+                tag TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE,
+                password_hash TEXT,
+                email_verified INTEGER DEFAULT 0,
+                nickname TEXT NOT NULL,
+                gender TEXT NOT NULL,
+                skill INTEGER NOT NULL,
+                elo INTEGER NOT NULL DEFAULT 100,
+                banned INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                tag TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS email_codes (
+                id {id_type},
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                used INTEGER DEFAULT 0,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lobby_online (
+                tag TEXT PRIMARY KEY,
+                last_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS invites (
+                id {id_type},
+                from_tag TEXT NOT NULL,
+                to_tag TEXT NOT NULL,
+                minutes INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS matchmaking_queue (
+                tag TEXT PRIMARY KEY,
+                minutes INTEGER NOT NULL,
+                elo_at_join INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS user_bans (
+                id {id_type},
+                tag TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL, -- 0 => permanent
+                revoked_ts INTEGER,
+                created_by_tag TEXT
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id {id_type},
+                from_tag TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open', -- MVP: open/closed
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id {id_type},
+                ticket_id INTEGER NOT NULL,
+                from_tag TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_user_bans_tag_active ON user_bans(tag, revoked_ts, expires_ts, created_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_from_tag_updated ON support_tickets(from_tag, updated_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_support_messages_ticket_created ON support_messages(ticket_id, created_ts)")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS games (
+                game_id TEXT PRIMARY KEY,
+                w_tag TEXT NOT NULL,
+                b_tag TEXT NOT NULL,
+                minutes INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                fen TEXT NOT NULL,
+                turn TEXT NOT NULL,
+
+                coins2_w INTEGER NOT NULL,
+                coins2_b INTEGER NOT NULL,
+
+                clock_w_rem INTEGER NOT NULL,
+                clock_b_rem INTEGER NOT NULL,
+                server_ts INTEGER NOT NULL,
+
+                post_buy_extra2_w INTEGER NOT NULL,
+                post_buy_extra2_b INTEGER NOT NULL,
+
+                moved_this_turn INTEGER NOT NULL,
+                bought_this_turn INTEGER NOT NULL,
+                bought_after_move INTEGER NOT NULL,
+
+                consecutive_pass_w INTEGER NOT NULL,
+                consecutive_pass_b INTEGER NOT NULL,
+
+                draw_offer_by TEXT NOT NULL DEFAULT '',
+                rematch_offer_by TEXT NOT NULL DEFAULT '',
+                last_move_from TEXT NOT NULL DEFAULT '',
+                last_move_to TEXT NOT NULL DEFAULT '',
+
+                result_json TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS game_results (
+                id {id_type},
+                game_id TEXT NOT NULL,
+                white_tag TEXT NOT NULL,
+                black_tag TEXT NOT NULL,
+                winner TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                elo_change_white INTEGER NOT NULL DEFAULT 0,
+                elo_change_black INTEGER NOT NULL DEFAULT 0,
+                finished_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_game_results_white ON game_results(white_tag, finished_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_game_results_black ON game_results(black_tag, finished_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_game_results_game_id ON game_results(game_id)")
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS friends (
+                id {id_type},
+                tag_a TEXT NOT NULL,
+                tag_b TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_ts INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_friends_a ON friends(tag_a, status)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_friends_b ON friends(tag_b, status)")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_friends_pair ON friends(tag_a, tag_b)")
+
+        ensure_column(con, "friends", "initiated_by", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(con, "users", "elo", "INTEGER NOT NULL DEFAULT 100")
+        ensure_column(con, "users", "games_played", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "users", "email", "TEXT")
+        ensure_column(con, "users", "password_hash", "TEXT")
+        ensure_column(con, "users", "email_verified", "INTEGER DEFAULT 0")
+        ensure_column(con, "games", "draw_offer_by", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(con, "games", "rematch_offer_by", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(con, "games", "last_move_from", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(con, "games", "last_move_to", "TEXT NOT NULL DEFAULT ''")
+        # Economy tracking columns
+        ensure_column(con, "games", "coins_spent_w", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "coins_spent_b", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "pieces_bought_w", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "pieces_bought_b", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "pieces_lost_w", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "pieces_lost_b", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "bounty_earned_w", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "games", "bounty_earned_b", "INTEGER NOT NULL DEFAULT 0")
+        # Purchased pieces tracking (JSON: {"e2": "p", "d1": "n", ...})
+        ensure_column(con, "games", "purchased_map_w", "TEXT NOT NULL DEFAULT '{}'")
+        ensure_column(con, "games", "purchased_map_b", "TEXT NOT NULL DEFAULT '{}'")
+        ensure_column(con, "invites", "status", "TEXT NOT NULL DEFAULT 'pending'")
+        ensure_column(con, "invites", "expires_ts", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "invites", "responded_ts", "INTEGER")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_invites_to_status_created ON invites(to_tag, status, created_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_invites_from_to_status ON invites(from_tag, to_tag, status)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_matchmaking_minutes_created ON matchmaking_queue(minutes, created_ts)")
+
+        for skill, elo in SKILL_TO_ELO.items():
+            con.execute("UPDATE users SET elo=? WHERE (elo IS NULL OR elo<=0) AND skill=?", (elo, skill))
+
+        # Migrate old tags to 7-digit IDs
+        users_to_migrate = con.execute("SELECT id, tag, email FROM users").fetchall()
+        for u in users_to_migrate:
+            old_tag = str(u["tag"])
+            if not re.match(r"^@[0-9]{7}$", old_tag):
+                if str(u["email"]) == ADMIN_EMAIL and not con.execute("SELECT id FROM users WHERE tag='@7777777'").fetchone():
+                    new_tag = "@7777777"
+                else:
+                    while True:
+                        new_tag = f"@{random.randint(1000000, 9999999)}"
+                        if not con.execute("SELECT id FROM users WHERE tag=?", (new_tag,)).fetchone():
+                            break
+                con.execute("UPDATE users SET tag=? WHERE id=?", (new_tag, u["id"]))
+                con.execute("UPDATE sessions SET tag=? WHERE tag=?", (new_tag, old_tag))
+                con.execute("UPDATE lobby_online SET tag=? WHERE tag=?", (new_tag, old_tag))
+                con.execute("UPDATE invites SET from_tag=? WHERE from_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE invites SET to_tag=? WHERE to_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE matchmaking_queue SET tag=? WHERE tag=?", (new_tag, old_tag))
+                con.execute("UPDATE user_bans SET tag=? WHERE tag=?", (new_tag, old_tag))
+                con.execute("UPDATE user_bans SET created_by_tag=? WHERE created_by_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE support_tickets SET from_tag=? WHERE from_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE support_messages SET from_tag=? WHERE from_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE games SET w_tag=? WHERE w_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE games SET b_tag=? WHERE b_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE game_results SET white_tag=? WHERE white_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE game_results SET black_tag=? WHERE black_tag=?", (new_tag, old_tag))
+                con.execute("UPDATE friends SET tag_a=? WHERE tag_a=?", (new_tag, old_tag))
+                con.execute("UPDATE friends SET tag_b=? WHERE tag_b=?", (new_tag, old_tag))
+                con.execute("UPDATE friends SET initiated_by=? WHERE initiated_by=?", (new_tag, old_tag))
+
+        con.commit()
+
+
+@app.on_event("startup")
+def _startup():
+    init_db()
+    print(f"[STARTUP] SMTP_USER configured: {bool(SMTP_USER)}")
+    print(f"[STARTUP] SMTP_PASSWORD configured: {bool(SMTP_PASSWORD)}")
+
+
+# =========================================================
+# Security: API key + session token
+# =========================================================
+def api_key_dep(x_api_key: Optional[str] = Header(default=None)) -> None:
+    if not x_api_key:
+        return
+    if not hmac.compare_digest(x_api_key, WEB_SECRET_KEY):
+        fail(401, "bad_api_key")
+
+
+def load_session_tag(token: str) -> Optional[str]:
+    if not token:
+        return None
+    with db() as con:
+        row = con.execute("SELECT tag, expires_ts FROM sessions WHERE token=?", (token,)).fetchone()
+        if row and int(row["expires_ts"]) < now_ts():
+            con.execute("DELETE FROM sessions WHERE token=?", (token,))
+            con.commit()
+            return None
+    if not row:
+        return None
+    return str(row["tag"])
+
+
+def session_dep(
+    _: None = Depends(api_key_dep),
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    tag = load_session_tag(token)
+    if not tag:
+        fail(401, "no_session")
+    return tag
+
+
+# =========================================================
+# Ban / Admin helpers (MVP)
+# =========================================================
+BANNED_ALLOWED_PATHS: Set[str] = {
+    "/api/app/ban_status",
+    "/api/support/ticket_create",
+    "/api/support/ticket_list",
+    "/api/support/ticket_messages",
+}
+
+
+def _norm_admin_reason(reason: str) -> str:
+    r = (reason or "").strip()
+    return r if r else "no_reason"
+
+
+def _is_tag_admin(con: sqlite3.Connection, tag: str) -> bool:
+    row = con.execute("SELECT email FROM users WHERE tag=?", (tag,)).fetchone()
+    return bool(row) and str(row["email"]) == ADMIN_EMAIL
+
+
+def _is_tag_tester(con: sqlite3.Connection, tag: str) -> bool:
+    row = con.execute("SELECT email FROM users WHERE tag=?", (tag,)).fetchone()
+    return bool(row) and str(row["email"]) == TESTER_EMAIL
+
+
+def _get_active_ban_row(con: sqlite3.Connection, tag: str, now: int) -> Optional[sqlite3.Row]:
+    return con.execute(
+        """
+        SELECT *
+        FROM user_bans
+        WHERE tag=?
+          AND revoked_ts IS NULL
+          AND (expires_ts=0 OR expires_ts>?)
+        ORDER BY created_ts DESC, id DESC
+        LIMIT 1
+        """,
+        (tag, int(now)),
+    ).fetchone()
+
+
+def _ban_payload_from_row(row: sqlite3.Row, now: int) -> Dict[str, Any]:
+    expires_ts = int(row["expires_ts"] or 0)
+    is_permanent = expires_ts == 0
+    remaining_seconds = 0
+    if not is_permanent:
+        remaining_seconds = max(0, expires_ts - int(now))
+    return {
+        "banned": True,
+        "is_permanent": bool(is_permanent),
+        "reason": str(row["reason"] or ""),
+        "remaining_seconds": int(remaining_seconds),
+        "expires_ts": int(expires_ts),
+    }
+
+
+def _sync_users_banned_from_user_bans(con: sqlite3.Connection, tag: str, now: int) -> None:
+    # Lazy sync: when user accesses app, keep users.banned consistent with user_bans.
+    row = con.execute("SELECT banned FROM users WHERE tag=?", (tag,)).fetchone()
+    if not row:
+        return
+    active = bool(_get_active_ban_row(con, tag, now))
+    want = 1 if active else 0
+    cur = int(row["banned"] or 0)
+    if cur != want:
+        con.execute("UPDATE users SET banned=? WHERE tag=?", (want, tag))
+        con.commit()
+
+
+async def session_dep_ban_guard(request: Request, tag: str = Depends(session_dep)) -> str:
+    if request.url.path in BANNED_ALLOWED_PATHS:
+        return tag
+    now = now_ts()
+    with db() as con:
+        active_row = _get_active_ban_row(con, tag, now)
+        _sync_users_banned_from_user_bans(con, tag, now)
+        if active_row:
+            fail(403, "banned")
+    return tag
+
+
+async def admin_only_dep(tag: str = Depends(session_dep_ban_guard)) -> str:
+    with db() as con:
+        if not _is_tag_admin(con, tag):
+            fail(403, "not_admin")
+    return tag
+
+
+# =========================================================
+# Users helpers
+# =========================================================
+def norm_tag(tag: str) -> str:
+    t = (tag or "").strip()
+    if not t.startswith("@"):
+        t = "@" + t
+    return t.lower()
+
+
+def get_user(tag: str) -> Optional[sqlite3.Row]:
+    with db() as con:
+        return con.execute("SELECT * FROM users WHERE tag=?", (tag,)).fetchone()
+
+
+def _get_user_info(con: sqlite3.Connection, tag: str) -> Optional[Dict[str, Any]]:
+    row = con.execute("SELECT tag, nickname, elo FROM users WHERE tag=?", (tag,)).fetchone()
+    if not row:
+        return None
+    return {"tag": str(row["tag"]), "nickname": str(row["nickname"]), "elo": int(row["elo"] or 0)}
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except Exception:
+        return False
+
+def generate_code() -> str:
+    return f"{secrets.randbelow(1000000):06d}"
+
+def send_email_code(email: str, code: str) -> bool:
+    """Send verification code via Gmail SMTP. Never raises — returns True/False.
+    Always logs the code to stdout so it's visible in Render logs as fallback."""
+    print(f"[EMAIL CODE] {email} -> {code}", flush=True)
+
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("[EMAIL] SMTP_USER or SMTP_PASSWORD not set — skipping send. Use code from logs.")
+        return False
+
+    html_body = (
+        f'<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">'
+        f'<h2 style="margin:0 0 16px">Economy Chess</h2>'
+        f'<p>Ваш код подтверждения:</p>'
+        f'<div style="font-size:32px;letter-spacing:8px;font-weight:bold;'
+        f'background:#f4f4f4;padding:16px;text-align:center;border-radius:8px">{code}</div>'
+        f'<p style="color:#888;margin-top:16px">Код действителен 10 минут.</p>'
+        f'</div>'
+    )
+
+    msg = EmailMessage()
+    msg['Subject'] = 'Код подтверждения Economy Chess'
+    msg['From'] = f"Economy Chess <{SMTP_USER}>"
+    msg['To'] = email
+    msg.set_content(f"Ваш код подтверждения: {code}")
+    msg.add_alternative(html_body, subtype='html')
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        print(f"[EMAIL] Sent OK via Gmail SMTP to {email}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL] SMTP FAILED for {email}: {type(e).__name__}: {e}")
+        return False
+
+def get_latest_email_code(con: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM email_codes WHERE user_id=? AND used=0 ORDER BY created_ts DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+
+
+def create_session(tag: str) -> str:
+    token = secrets.token_urlsafe(24)
+    now = now_ts()
+    exp = now + 14 * 24 * 3600
+    with db() as con:
+        con.execute(
+            "INSERT INTO sessions(token, tag, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (token, tag, now, exp),
+        )
+        con.commit()
+    return token
+
+
+# =========================================================
+# Game rules (Economy Chess)
+# =========================================================
+START_FEN_KINGS_ONLY = "4k3/8/8/8/8/8/8/4K3 w - - 0 1"
+
+BASE_COSTS2 = {
+    "p": 2,
+    "n": 5,
+    "b": 7,
+    "r": 9,
+    "q": 18,
+}
+
+
+def piece_type_from_char(ch: str) -> Optional[int]:
+    m = {
+        "p": chess.PAWN,
+        "n": chess.KNIGHT,
+        "b": chess.BISHOP,
+        "r": chess.ROOK,
+        "q": chess.QUEEN,
+        "k": chess.KING,
+    }
+    return m.get(ch.lower())
+
+
+def update_clocks_inplace(row: Dict[str, Any]) -> None:
+    if row["status"] != "active":
+        return
+    now = now_ts()
+    last = int(row["server_ts"])
+    if now <= last:
+        return
+    dt = now - last
+    if row["turn"] == "w":
+        row["clock_w_rem"] = max(0, int(row["clock_w_rem"]) - dt)
+    else:
+        row["clock_b_rem"] = max(0, int(row["clock_b_rem"]) - dt)
+    row["server_ts"] = now
+
+
+def finish_if_needed_inplace(row: Dict[str, Any]) -> None:
+    if row["status"] != "active":
+        return
+
+    if int(row["clock_w_rem"]) <= 0:
+        row["status"] = "finished"
+        row["result_json"] = json.dumps({"winner": "b", "reason": "timeout"})
+        row["draw_offer_by"] = ""
+        return
+    if int(row["clock_b_rem"]) <= 0:
+        row["status"] = "finished"
+        row["result_json"] = json.dumps({"winner": "w", "reason": "timeout"})
+        row["draw_offer_by"] = ""
+        return
+
+    board = chess.Board(row["fen"])
+    if board.is_checkmate():
+        winner = "b" if board.turn == chess.WHITE else "w"
+        row["status"] = "finished"
+        row["result_json"] = json.dumps({"winner": winner, "reason": "checkmate"})
+        row["draw_offer_by"] = ""
+        return
+    if board.is_stalemate():
+        row["status"] = "finished"
+        row["result_json"] = json.dumps({"winner": "", "reason": "stalemate"})
+        row["draw_offer_by"] = ""
+        return
+
+
+def load_game_row(con: sqlite3.Connection, gid: str) -> Optional[sqlite3.Row]:
+    return con.execute("SELECT * FROM games WHERE game_id=?", (gid,)).fetchone()
+
+
+def get_user_public(tag: str) -> Dict[str, Any]:
+    user = get_user(tag)
+    is_admin = False
+    is_tester = False
+    with db() as con:
+        is_admin = _is_tag_admin(con, tag)
+        is_tester = _is_tag_tester(con, tag)
+    admin_label = "admin" if is_admin else ("tester" if is_tester else "")
+    if not user:
+        return {"tag": tag, "nickname": tag, "elo": 0, "is_admin": is_admin, "is_tester": is_tester, "admin": admin_label}
+    return {
+        "tag": tag,
+        "nickname": str(user["nickname"]),
+        "elo": int(user["elo"] or 0),
+        "is_admin": is_admin,
+        "is_tester": is_tester,
+        "admin": admin_label,
+    }
+
+
+def _get_elo_change(row, color_side: str) -> int:
+    """Fetch elo change from game_results table (not from games table)."""
+    gid = row.get("game_id", "")
+    if not gid:
+        return 0
+    try:
+        with db() as con:
+            gr = con.execute(
+                f"SELECT elo_change_{color_side} FROM game_results WHERE game_id=?",
+                (gid,)
+            ).fetchone()
+            if gr:
+                return int(gr[0] or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def row_to_game(row, viewer_tag: str) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        row = dict(row)
+    you = "w" if row["w_tag"] == viewer_tag else ("b" if row["b_tag"] == viewer_tag else "")
+    w_user = get_user_public(str(row["w_tag"]))
+    b_user = get_user_public(str(row["b_tag"]))
+    return {
+        "game_id": row["game_id"],
+        "w_tag": row["w_tag"],
+        "b_tag": row["b_tag"],
+        "w_nickname": w_user["nickname"],
+        "b_nickname": b_user["nickname"],
+        "w_is_admin": bool(w_user.get("is_admin")),
+        "b_is_admin": bool(b_user.get("is_admin")),
+        "w_admin": str(w_user.get("admin") or ""),
+        "b_admin": str(b_user.get("admin") or ""),
+        "w_elo": w_user["elo"],
+        "b_elo": b_user["elo"],
+        "you": you,
+        "minutes": int(row["minutes"]),
+        "status": row["status"],
+        "fen": row["fen"],
+        "turn": row["turn"],
+        "coins2_w": int(row["coins2_w"]),
+        "coins2_b": int(row["coins2_b"]),
+        "clock_w_rem": int(row["clock_w_rem"]),
+        "clock_b_rem": int(row["clock_b_rem"]),
+        "server_ts": int(row["server_ts"]),
+        "post_buy_extra2": {
+            "w": int(row["post_buy_extra2_w"]),
+            "b": int(row["post_buy_extra2_b"]),
+        },
+        "draw_offer_by": str(row["draw_offer_by"] or ""),
+        "rematch_offer_by": str(row["rematch_offer_by"] or ""),
+        "last_move": {
+            "from": str(row["last_move_from"] or ""),
+            "to": str(row["last_move_to"] or ""),
+        },
+        "result": json.loads(row["result_json"]) if row["result_json"] else {},
+        "elo_change_w": _get_elo_change(row, "white") if row["status"] == "finished" else 0,
+        "elo_change_b": _get_elo_change(row, "black") if row["status"] == "finished" else 0,
+        "economy": {
+            "coins_spent_w": int(row.get("coins_spent_w") or 0),
+            "coins_spent_b": int(row.get("coins_spent_b") or 0),
+            "pieces_bought_w": int(row.get("pieces_bought_w") or 0),
+            "pieces_bought_b": int(row.get("pieces_bought_b") or 0),
+            "pieces_lost_w": int(row.get("pieces_lost_w") or 0),
+            "pieces_lost_b": int(row.get("pieces_lost_b") or 0),
+            "bounty_earned_w": int(row.get("bounty_earned_w") or 0),
+            "bounty_earned_b": int(row.get("bounty_earned_b") or 0),
+        },
+    }
+
+
+def create_game_on_con(con: sqlite3.Connection, w_tag: str, b_tag: str, minutes: int) -> str:
+    gid = secrets.token_urlsafe(12)
+    total = max(60, int(minutes) * 60)
+    con.execute(
+        """
+        INSERT INTO games(
+            game_id, w_tag, b_tag, minutes, status, fen, turn,
+            coins2_w, coins2_b,
+            clock_w_rem, clock_b_rem, server_ts,
+            post_buy_extra2_w, post_buy_extra2_b,
+            moved_this_turn, bought_this_turn, bought_after_move,
+            consecutive_pass_w, consecutive_pass_b,
+            draw_offer_by, rematch_offer_by,
+            last_move_from, last_move_to,
+            result_json,
+            coins_spent_w, coins_spent_b,
+            pieces_bought_w, pieces_bought_b,
+            pieces_lost_w, pieces_lost_b,
+            bounty_earned_w, bounty_earned_b,
+            purchased_map_w, purchased_map_b
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            gid,
+            w_tag,
+            b_tag,
+            int(minutes),
+            "active",
+            START_FEN_KINGS_ONLY,
+            "w",
+            10,
+            10,
+            total,
+            total,
+            now_ts(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "",
+            "",
+            "",
+            "",
+            "",
+            0, 0,
+            0, 0,
+            0, 0,
+            0, 0,
+            "{}", "{}",
+        ),
+    )
+    return gid
+
+
+def create_game(w_tag: str, b_tag: str, minutes: int) -> str:
+    gid = secrets.token_urlsafe(12)
+    total = max(60, int(minutes) * 60)
+    with db() as con:
+        gid2 = create_game_on_con(con, w_tag, b_tag, minutes)
+        con.commit()
+    return gid2
+
+
+def behind_pawn_square(board: chess.Board, color: bool, file_idx: int) -> Optional[chess.Square]:
+    pawns = board.pieces(chess.PAWN, color)
+    candidates: List[chess.Square] = [sq for sq in pawns if chess.square_file(sq) == file_idx]
+    if not candidates:
+        return None
+
+    if color == chess.WHITE:
+        pawn_sq = max(candidates, key=lambda s: chess.square_rank(s))
+        back_rank = chess.square_rank(pawn_sq) - 1
+    else:
+        pawn_sq = min(candidates, key=lambda s: chess.square_rank(s))
+        back_rank = chess.square_rank(pawn_sq) + 1
+
+    if back_rank < 0 or back_rank > 7:
+        return None
+    return chess.square(file_idx, back_rank)
+
+
+def legal_drop_targets(board: chess.Board, you_color: bool, piece_ch: str) -> Set[str]:
+    piece_ch = piece_ch.lower().strip()
+    targets: Set[str] = set()
+    in_check = board.is_check()
+
+    if piece_ch == "p":
+        rank = 1 if you_color == chess.WHITE else 6
+        for file_idx in range(8):
+            sq = chess.square(file_idx, rank)
+            if board.piece_at(sq) is not None:
+                continue
+            if in_check:
+                b2 = board.copy(stack=False)
+                b2.set_piece_at(sq, chess.Piece(chess.PAWN, you_color))
+                if not b2.is_check():
+                    continue
+            targets.add(chess.square_name(sq))
+        return targets
+
+    if piece_ch in ("n", "b", "r", "q"):
+        for file_idx in range(8):
+            sq = behind_pawn_square(board, you_color, file_idx)
+            if sq is None:
+                continue
+            if board.piece_at(sq) is not None:
+                continue
+            if in_check:
+                b2 = board.copy(stack=False)
+                ptype = piece_type_from_char(piece_ch)
+                if ptype is None:
+                    continue
+                b2.set_piece_at(sq, chess.Piece(ptype, you_color))
+                if not b2.is_check():
+                    continue
+            targets.add(chess.square_name(sq))
+        return targets
+
+    return targets
+
+
+def capture_bonus2(mover: chess.Piece, captured: chess.Piece) -> int:
+    mover_t = mover.piece_type
+    cap_t = captured.piece_type
+
+    if cap_t == chess.PAWN:
+        if mover_t == chess.PAWN:
+            return 1
+        if mover_t == chess.KING:
+            return 1
+        return 0
+
+    if mover_t == chess.PAWN:
+        return 3
+    if mover_t == chess.KING:
+        return 4
+    return 2
+
+
+def save_game_state(con: sqlite3.Connection, row: Dict[str, Any]) -> None:
+    con.execute(
+        """
+        UPDATE games SET
+            status=?, fen=?, turn=?,
+            coins2_w=?, coins2_b=?,
+            clock_w_rem=?, clock_b_rem=?, server_ts=?,
+            post_buy_extra2_w=?, post_buy_extra2_b=?,
+            moved_this_turn=?, bought_this_turn=?, bought_after_move=?,
+            consecutive_pass_w=?, consecutive_pass_b=?,
+            draw_offer_by=?, rematch_offer_by=?,
+            last_move_from=?, last_move_to=?,
+            result_json=?,
+            coins_spent_w=?, coins_spent_b=?,
+            pieces_bought_w=?, pieces_bought_b=?,
+            pieces_lost_w=?, pieces_lost_b=?,
+            bounty_earned_w=?, bounty_earned_b=?,
+            purchased_map_w=?, purchased_map_b=?
+        WHERE game_id=?
+        """,
+        (
+            row["status"],
+            row["fen"],
+            row["turn"],
+            row["coins2_w"],
+            row["coins2_b"],
+            row["clock_w_rem"],
+            row["clock_b_rem"],
+            row["server_ts"],
+            row["post_buy_extra2_w"],
+            row["post_buy_extra2_b"],
+            row["moved_this_turn"],
+            row["bought_this_turn"],
+            row["bought_after_move"],
+            row["consecutive_pass_w"],
+            row["consecutive_pass_b"],
+            row.get("draw_offer_by", ""),
+            row.get("rematch_offer_by", ""),
+            row.get("last_move_from", ""),
+            row.get("last_move_to", ""),
+            row.get("result_json", ""),
+            int(row.get("coins_spent_w") or 0),
+            int(row.get("coins_spent_b") or 0),
+            int(row.get("pieces_bought_w") or 0),
+            int(row.get("pieces_bought_b") or 0),
+            int(row.get("pieces_lost_w") or 0),
+            int(row.get("pieces_lost_b") or 0),
+            int(row.get("bounty_earned_w") or 0),
+            int(row.get("bounty_earned_b") or 0),
+            str(row.get("purchased_map_w") or "{}"),
+            str(row.get("purchased_map_b") or "{}"),
+            row["game_id"],
+        ),
+    )
+
+
+def _calc_elo_change(elo_a: int, elo_b: int, score_a: float, games_a: int, games_b: int) -> tuple:
+    """Calculate ELO changes for both players. Returns (delta_a, delta_b)."""
+    ea = 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
+    eb = 1.0 - ea
+    score_b = 1.0 - score_a
+    k_a = ELO_K_PROVISIONAL if games_a < ELO_PROVISIONAL_GAMES else ELO_K_DEFAULT
+    k_b = ELO_K_PROVISIONAL if games_b < ELO_PROVISIONAL_GAMES else ELO_K_DEFAULT
+    delta_a = round(k_a * (score_a - ea))
+    delta_b = round(k_b * (score_b - eb))
+    return delta_a, delta_b
+
+
+def _finalize_game(con: sqlite3.Connection, row: Dict[str, Any]) -> None:
+    """Called once when a game transitions to 'finished'. Saves ELO + game_results."""
+    gid = str(row["game_id"])
+    w_tag = str(row["w_tag"])
+    b_tag = str(row["b_tag"])
+
+    # Check if already recorded
+    existing = con.execute("SELECT id FROM game_results WHERE game_id=?", (gid,)).fetchone()
+    if existing:
+        return
+
+    result = {}
+    rj = row.get("result_json") or ""
+    if rj:
+        try:
+            result = json.loads(rj)
+        except Exception:
+            pass
+
+    winner_side = str(result.get("winner") or "")
+    reason = str(result.get("reason") or "finished")
+    now = now_ts()
+
+    if winner_side == "w":
+        winner_label = "white"
+        score_w = 1.0
+    elif winner_side == "b":
+        winner_label = "black"
+        score_w = 0.0
+    else:
+        winner_label = "draw"
+        score_w = 0.5
+
+    w_user = con.execute("SELECT elo, games_played FROM users WHERE tag=?", (w_tag,)).fetchone()
+    b_user = con.execute("SELECT elo, games_played FROM users WHERE tag=?", (b_tag,)).fetchone()
+
+    w_elo = int(w_user["elo"] or 0) if w_user else 0
+    b_elo = int(b_user["elo"] or 0) if b_user else 0
+    w_gp = int(w_user["games_played"] or 0) if w_user else 0
+    b_gp = int(b_user["games_played"] or 0) if b_user else 0
+
+    delta_w, delta_b = _calc_elo_change(w_elo, b_elo, score_w, w_gp, b_gp)
+
+    new_w_elo = max(0, w_elo + delta_w)
+    new_b_elo = max(0, b_elo + delta_b)
+
+    con.execute("UPDATE users SET elo=?, games_played=? WHERE tag=?", (new_w_elo, w_gp + 1, w_tag))
+    con.execute("UPDATE users SET elo=?, games_played=? WHERE tag=?", (new_b_elo, b_gp + 1, b_tag))
+
+    con.execute(
+        """
+        INSERT INTO game_results(game_id, white_tag, black_tag, winner, reason, elo_change_white, elo_change_black, finished_ts)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (gid, w_tag, b_tag, winner_label, reason, delta_w, delta_b, now),
+    )
+
+    con.commit()
+
+
+def _get_purchased_map(row: Dict[str, Any], side: str) -> Dict[str, str]:
+    """Parse purchased_map JSON for given side ('w' or 'b')."""
+    raw = str(row.get(f"purchased_map_{side}") or "{}")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _set_purchased_map(row: Dict[str, Any], side: str, pmap: Dict[str, str]) -> None:
+    row[f"purchased_map_{side}"] = json.dumps(pmap, ensure_ascii=False)
+
+
+def _update_purchased_map_on_move(row: Dict[str, Any], from_sq: str, to_sq: str, mover_side: str) -> None:
+    """When a piece moves, update purchased tracking if it was purchased."""
+    pmap = _get_purchased_map(row, mover_side)
+    if from_sq in pmap:
+        piece_char = pmap.pop(from_sq)
+        pmap[to_sq] = piece_char
+        _set_purchased_map(row, mover_side, pmap)
+
+
+def _check_bounty_on_capture(row: Dict[str, Any], captured_sq: str, capturer_side: str) -> int:
+    """Check if captured piece was purchased. Returns bounty in half-coins (0 if no bounty)."""
+    victim_side = "b" if capturer_side == "w" else "w"
+    pmap = _get_purchased_map(row, victim_side)
+    if captured_sq not in pmap:
+        return 0
+    piece_char = pmap.pop(captured_sq)
+    _set_purchased_map(row, victim_side, pmap)
+    base2 = BASE_COSTS2.get(piece_char, 0)
+    bounty2 = max(1, base2 // 2)  # 50% of base cost, minimum 0.5 coin
+    # Track pieces_lost for victim
+    lost_key = f"pieces_lost_{victim_side}"
+    row[lost_key] = int(row.get(lost_key) or 0) + 1
+    # Track bounty_earned for capturer
+    bounty_key = f"bounty_earned_{capturer_side}"
+    row[bounty_key] = int(row.get(bounty_key) or 0) + bounty2
+    return bounty2
+
+
+def refresh_game_row(con: sqlite3.Connection, row_db: sqlite3.Row) -> sqlite3.Row:
+    row = dict(row_db)
+    before = (
+        row["status"],
+        row["clock_w_rem"],
+        row["clock_b_rem"],
+        row["server_ts"],
+        row["result_json"],
+    )
+    update_clocks_inplace(row)
+    finish_if_needed_inplace(row)
+    after = (
+        row["status"],
+        row["clock_w_rem"],
+        row["clock_b_rem"],
+        row["server_ts"],
+        row.get("result_json", ""),
+    )
+    if after != before:
+        save_game_state(con, row)
+        if row["status"] == "finished":
+            _finalize_game(con, row)
+        con.commit()
+        return load_game_row(con, str(row["game_id"])) or row_db
+    return row_db
+
+
+# =========================================================
+# WebSocket hubs
+# =========================================================
+class LobbyHub:
+    def __init__(self):
+        self.conns: Dict[str, Set[WebSocket]] = {}
+        self.lock = asyncio.Lock()
+
+    async def add(self, tag: str, ws: WebSocket):
+        async with self.lock:
+            self.conns.setdefault(tag, set()).add(ws)
+        await self.broadcast_online()
+
+    async def remove(self, tag: str, ws: WebSocket):
+        async with self.lock:
+            if tag in self.conns and ws in self.conns[tag]:
+                self.conns[tag].remove(ws)
+            if tag in self.conns and not self.conns[tag]:
+                del self.conns[tag]
+        await self.broadcast_online()
+
+    def is_online(self, tag: str) -> bool:
+        return tag in self.conns and len(self.conns[tag]) > 0
+
+    async def send_to(self, tag: str, payload: Dict[str, Any]):
+        async with self.lock:
+            sockets = list(self.conns.get(tag, set()))
+        stale: List[WebSocket] = []
+        for ws in sockets:
+            try:
+                await ws.send_text(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                stale.append(ws)
+        if stale:
+            async with self.lock:
+                for ws in stale:
+                    if tag in self.conns and ws in self.conns[tag]:
+                        self.conns[tag].remove(ws)
+                if tag in self.conns and not self.conns[tag]:
+                    del self.conns[tag]
+
+    async def broadcast_online(self):
+        async with self.lock:
+            tags = list(self.conns.keys())
+
+        now = now_ts()
+        online = []
+        with db() as con:
+            for tag in tags:
+                user = con.execute("SELECT tag, nickname, elo FROM users WHERE tag=?", (tag,)).fetchone()
+                if not user:
+                    continue
+                if _get_active_ban_row(con, str(tag), now):
+                    continue
+                online.append(
+                    {
+                        "tag": tag,
+                        "nickname": str(user["nickname"]),
+                        "elo": int(user["elo"] or 0),
+                        "is_admin": _is_tag_admin(con, str(tag)),
+                        "admin": "admin" if _is_tag_admin(con, str(tag)) else "",
+                    }
+                )
+        online.sort(key=lambda item: (-int(item["elo"]), str(item["nickname"]).lower()))
+
+        for tag in tags:
+            await self.send_to(tag, {"type": "online", "data": {"online": online}})
+
+
+class GameHub:
+    def __init__(self):
+        self.conns: Dict[str, Set[WebSocket]] = {}
+        self.lock = asyncio.Lock()
+
+    async def add(self, gid: str, ws: WebSocket):
+        async with self.lock:
+            self.conns.setdefault(gid, set()).add(ws)
+
+    async def remove(self, gid: str, ws: WebSocket):
+        async with self.lock:
+            if gid in self.conns and ws in self.conns[gid]:
+                self.conns[gid].remove(ws)
+            if gid in self.conns and not self.conns[gid]:
+                del self.conns[gid]
+
+    async def push(self, gid: str, payload: Dict[str, Any]):
+        async with self.lock:
+            sockets = list(self.conns.get(gid, set()))
+        stale: List[WebSocket] = []
+        for ws in sockets:
+            try:
+                await ws.send_text(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                stale.append(ws)
+        if stale:
+            async with self.lock:
+                for ws in stale:
+                    if gid in self.conns and ws in self.conns[gid]:
+                        self.conns[gid].remove(ws)
+                if gid in self.conns and not self.conns[gid]:
+                    del self.conns[gid]
+
+
+lobby_hub = LobbyHub()
+game_hub = GameHub()
+
+
+# =========================================================
+# AUTH API
+# =========================================================
+def _contains_banned_word(nickname: str, email: str) -> bool:
+    # Allow admin user to use reserved nickname "Eterion"
+    ADMIN_EMAIL = 'e.vlasov2949@gmail.com'
+    if email == ADMIN_EMAIL and nickname.lower() == 'eterion':
+        return False
+    # Remove everything except letters (including Cyrillic) to catch fuzzy bypasses like Ant-i-grav-ity
+    clean = re.sub(r'[^a-zA-Zа-яА-Я]', '', nickname).lower()
+    return 'eterion' in clean or 'antigravity' in clean
+
+@app.post("/api/auth/register")
+@limiter.limit("5/minute")
+async def register(request: Request, _: None = Depends(api_key_dep)):
+    logger.info("POST /api/auth/register")
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    print(f"[BACKEND auth] Payload email: '{email}'")
+    password = body.get("password", "")
+    password_confirm = body.get("password_confirm", "")
+    nickname = (body.get("nickname") or "").strip()
+    gender = (body.get("gender") or "").strip().lower()
+    skill = int(body.get("skill") or 0)
+
+    if not email or "@" not in email:
+        print("[BACKEND auth] Error: bad_email")
+        return JSONResponse({"ok": False, "reason": "bad_email"}, status_code=400)
+    if len(password) < 8 or not any(c.isdigit() for c in password):
+        print("[BACKEND auth] Error: bad_password (validation)")
+        return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
+    if password != password_confirm:
+        print("[BACKEND auth] Error: password_mismatch")
+        return JSONResponse({"ok": False, "reason": "password_mismatch"}, status_code=400)
+    if not nickname or gender not in ("m", "f") or skill not in SKILL_TO_ELO:
+        print("[BACKEND auth] Error: bad_fields (nickname, gender, skill missing or invalid)")
+        return JSONResponse({"ok": False, "reason": "bad_fields"}, status_code=400)
+
+    with db() as con:
+        if con.execute("SELECT email FROM users WHERE email=?", (email,)).fetchone():
+            print("[BACKEND auth] Error: email_taken")
+            return JSONResponse({"ok": False, "reason": "email_taken"}, status_code=400)
+        
+        if _use_postgres:
+            if con.execute("SELECT id FROM users WHERE LOWER(nickname)=LOWER(%s)", (nickname,)).fetchone():
+                print("[BACKEND auth] Error: nickname_taken")
+                return JSONResponse({"ok": False, "reason": "nickname_taken"}, status_code=400)
+        else:
+            if con.execute("SELECT id FROM users WHERE nickname=? COLLATE NOCASE", (nickname,)).fetchone():
+                print("[BACKEND auth] Error: nickname_taken")
+                return JSONResponse({"ok": False, "reason": "nickname_taken"}, status_code=400)
+        
+        if _contains_banned_word(nickname, email):
+            print(f"[BACKEND auth] Error: nickname_restricted (fuzzy matched) for email {email}")
+            # Registration fails with a special reason, and we insert a ban record
+            # We'll create the user but mark them as banned for 3600 seconds (1 hour)
+            tag_candidate = f"@{random.randint(1000000, 9999999)}"
+            pwd_hash = hash_password(password)
+            _now = now_ts()
+            _exp = _now + 3600
+            
+            con.execute(
+                "INSERT INTO users(tag, email, password_hash, email_verified, nickname, gender, skill, elo, banned, created_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tag_candidate, email, pwd_hash, 1, nickname, gender, skill, 100, 1, _now)
+            )
+            con.execute(
+                "INSERT INTO user_bans(tag, reason, created_ts, expires_ts, created_by_tag) VALUES (?,?,?,?,?)",
+                (tag_candidate, "restricted_nickname_attempt", _now, _exp, "@SYSTEM")
+            )
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "nickname_restricted_ban"}, status_code=400)
+        
+        tag_candidate = ""
+        if email == ADMIN_EMAIL and not con.execute("SELECT id FROM users WHERE tag='@7777777'").fetchone():
+            tag_candidate = "@7777777"
+        else:
+            while True:
+                tag_candidate = f"@{random.randint(1000000, 9999999)}"
+                if tag_candidate == "@7777777":
+                    continue
+                if not con.execute("SELECT id FROM users WHERE tag=?", (tag_candidate,)).fetchone():
+                    break
+
+        elo = SKILL_TO_ELO[skill]
+        pwd_hash = hash_password(password)
+
+        con.execute(
+            """
+            INSERT INTO users(tag, email, password_hash, email_verified, nickname, gender, skill, elo, banned, created_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (tag_candidate, email, pwd_hash, 0, nickname, gender, skill, elo, 0, now_ts()),
+        )
+        
+
+        # Safe debug autoban (server-side env flag only).
+        if DEBUG_BAN_WOMEN_ON_REGISTER and gender == "f":
+            _now = now_ts()
+            _exp = _now + int(DEBUG_BAN_WOMEN_SECONDS)
+            _reason = "debug_autoban_women_10y"
+            con.execute(
+                """
+                INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (tag_candidate, _reason, _now, _exp, None, None),
+            )
+            con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag_candidate,))
+
+        # Tester bypass: auto-verify and instant login
+        if email == TESTER_EMAIL:
+            print("[BACKEND auth] Tester email used, bypassing verification")
+            con.execute("UPDATE users SET email_verified=1 WHERE tag=?", (tag_candidate,))
+            con.commit()
+            token = create_session(tag_candidate)
+            is_admin = _is_tag_admin(con, tag_candidate)
+            return JSONResponse({
+                "ok": True,
+                "token": token,
+                "user": {
+                    "tag": tag_candidate,
+                    "nickname": nickname,
+                    "elo": elo,
+                    "skill": skill,
+                    "is_admin": bool(is_admin),
+                    "is_tester": True,
+                },
+            })
+
+        logger.info(f"DB insert success for tag: {tag_candidate}")
+
+
+        # Generate and save verification code
+        user_row = con.execute("SELECT id FROM users WHERE tag=?", (tag_candidate,)).fetchone()
+        user_id = int(user_row["id"])
+        now_reg = now_ts()
+        code = generate_code()
+        code_exp = now_reg + 10 * 60
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (user_id, code, now_reg, code_exp)
+        )
+
+        con.commit()
+
+    # Send verification email (fail-safe: never blocks registration)
+    print(f"[BACKEND auth] Prepared code {code} for user {user_id}. Attempting to send email...")
+    send_email_code(email, code)
+
+    masked = email.split('@')[0][:3] + "***@" + email.split('@')[1] if "@" in email else email
+    print(f"[BACKEND auth] Done. Sent 200 OK, code_sent response.")
+    return JSONResponse({"ok": True, "status": "code_sent", "email": masked})
+
+@app.post("/api/auth/login")
+@limiter.limit("10/minute")
+async def auth_login(request: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/login")
+    body = await request.json()
+    identifier = (body.get("identifier") or "").strip().lower()
+    print(f"[BACKEND auth] Payload identifier: '{identifier}'")
+    password = body.get("password", "")
+
+    if not identifier or not password:
+        print("[BACKEND auth] Error: bad_input (empty string)")
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    with db() as con:
+        user = con.execute(
+            "SELECT id, tag, email, password_hash, email_verified, nickname, elo, skill FROM users WHERE email=? OR tag=? OR nickname=?",
+            (identifier, identifier, identifier),
+        ).fetchone()
+        if not user:
+            print(f"[BACKEND auth] Error: not_found (identifier {identifier} not in DB)")
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+
+        if not verify_password(password, str(user["password_hash"])):
+            print(f"[BACKEND auth] Error: bad_password for user {user['tag']}")
+            return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
+
+        tag = str(user["tag"])
+        is_tester = _is_tag_tester(con, tag)
+        print(f"[BACKEND auth] Found user: tag={tag}, email_verified={user['email_verified']}, tester={is_tester}")
+
+        # Tester bypass: skip email verification check
+        if not int(user["email_verified"] or 0) and not is_tester:
+            print("[BACKEND auth] Error: email_not_verified")
+            return JSONResponse({"ok": False, "reason": "email_not_verified"}, status_code=403)
+
+        # Auto-verify tester if not yet verified
+        if is_tester and not int(user["email_verified"] or 0):
+            con.execute("UPDATE users SET email_verified=1 WHERE tag=?", (tag,))
+            con.commit()
+
+        is_admin = _is_tag_admin(con, tag)
+
+    print(f"[BACKEND auth] Creating session token for {tag}")
+    token = create_session(tag)
+
+    print(f"[BACKEND auth] Login success, returning 200 OK")
+    return JSONResponse({
+        "ok": True,
+        "token": token,
+        "user": {
+            "tag": tag,
+            "nickname": str(user["nickname"]),
+            "elo": int(user["elo"] or 0),
+            "skill": int(user["skill"] or 0),
+            "is_admin": bool(is_admin),
+            "is_tester": bool(is_tester),
+        },
+    })
+
+@app.post("/api/auth/verify-code")
+@limiter.limit("15/minute")
+async def auth_verify_code(request: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/verify-code")
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    code = (body.get("code") or "").strip()
+    print(f"[BACKEND auth] Payload email: '{email}', code length: {len(code)}")
+
+    if not email or not code:
+        print("[BACKEND auth] Error: bad_input (empty string)")
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    now = now_ts()
+    with db() as con:
+        user = con.execute("SELECT id, tag, nickname, elo, skill FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            print(f"[BACKEND auth] Error: not_found (email {email} not in DB)")
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+            
+        user_id = int(user["id"])
+        tag = str(user["tag"])
+
+        email_record = get_latest_email_code(con, user_id)
+        if not email_record:
+            print(f"[BACKEND auth] Error: bad_code (no un-used code found for user_id={user_id})")
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+            
+        attempts = int(email_record["attempts"])
+        if attempts >= 5:
+            print(f"[BACKEND auth] Error: max_attempts (code attempted {attempts} times)")
+            return JSONResponse({"ok": False, "reason": "max_attempts"}, status_code=400)
+            
+        if int(email_record["expires_ts"]) < now:
+            print(f"[BACKEND auth] Error: bad_code (code expired at {email_record['expires_ts']})")
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+
+        if str(email_record["code"]) != code:
+            print(f"[BACKEND auth] Error: bad_code (mismatch, attempts={attempts+1})")
+            con.execute("UPDATE email_codes SET attempts=attempts+1 WHERE id=?", (email_record["id"],))
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "bad_code"}, status_code=400)
+
+        print("[BACKEND auth] Code matched! Verifying user email...")
+        con.execute("UPDATE email_codes SET used=1 WHERE id=?", (email_record["id"],))
+        con.execute("UPDATE users SET email_verified=1 WHERE id=?", (user_id,))
+        con.commit()
+
+    token = create_session(tag)
+
+    is_admin = False
+    with db() as con2:
+        is_admin = _is_tag_admin(con2, tag)
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "token": token,
+            "user": {
+                "tag": tag,
+                "nickname": str(user["nickname"]),
+                "elo": int(user["elo"] or 0),
+                "skill": int(user["skill"] or 0),
+                "is_admin": bool(is_admin),
+            },
+        }
+    )
+
+
+# =========================================================
+# Resend verification code
+# =========================================================
+@app.post("/api/auth/resend-code")
+@limiter.limit("5/minute")
+async def auth_resend_code(request: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/resend-code")
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    print(f"[BACKEND auth] Payload email: '{email}'")
+
+    if not email:
+        print("[BACKEND auth] Error: bad_input (empty string)")
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    with db() as con:
+        user = con.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            print(f"[BACKEND auth] Error: not_found")
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+        if int(user["email_verified"] or 0):
+            print(f"[BACKEND auth] Error: already_verified")
+            return JSONResponse({"ok": False, "reason": "already_verified"}, status_code=400)
+
+        user_id = int(user["id"])
+        now = now_ts()
+
+        recent = con.execute(
+            "SELECT COUNT(*) as c FROM email_codes WHERE user_id=? AND created_ts > ?",
+            (user_id, now - 60)
+        ).fetchone()
+        if recent and recent["c"] > 0:
+            print(f"[BACKEND auth] Error: rate_limit (recently created a code for user_id={user_id})")
+            return JSONResponse({"ok": False, "reason": "rate_limit"}, status_code=429)
+
+        con.execute("UPDATE email_codes SET used=1 WHERE user_id=?", (user_id,))
+        code = generate_code()
+        exp = now + 10 * 60
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts, expires_ts) VALUES (?,?,?,?)",
+            (user_id, code, now, exp)
+        )
+        con.commit()
+
+    # Fail-safe: never return 500 for email issues
+    send_email_code(email, code)
+
+    return JSONResponse({"ok": True, "status": "code_sent"})
+
+
+# =========================================================
+# Password Reset API
+# =========================================================
+@app.post("/api/auth/request-password-reset")
+@limiter.limit("5/minute")
+async def auth_request_password_reset(request: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/request-password-reset")
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    print(f"[BACKEND auth] Payload email: '{email}'")
+
+    if not email:
+        print("[BACKEND auth] Error: bad_input")
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    with db() as con:
+        user = con.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            print(f"[BACKEND auth] Error: not_found")
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+
+        user_id = int(user["id"])
+        now = now_ts()
+
+        # Generate and store reset code
+        code = f"{random.randint(100000, 999999)}"
+        con.execute(
+            "INSERT INTO email_codes(user_id, code, created_ts) VALUES (?, ?, ?)",
+            (user_id, code, now)
+        )
+        print(f"[BACKEND auth] Password reset code generated: {code}")
+
+        send_email_code(email, code)
+
+    return JSONResponse({"ok": True, "status": "code_sent"})
+
+
+@app.post("/api/auth/reset-password")
+@limiter.limit("5/minute")
+async def auth_reset_password(request: Request, _: None = Depends(api_key_dep)):
+    print("\n[BACKEND auth] POST /api/auth/reset-password")
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    code = body.get("code", "").strip()
+    new_password = body.get("new_password", "")
+    print(f"[BACKEND auth] Payload email: '{email}', code: '{code}'")
+
+    if not email or not code or not new_password:
+        print("[BACKEND auth] Error: bad_input")
+        return JSONResponse({"ok": False, "reason": "bad_input"}, status_code=400)
+
+    if len(new_password) < 8 or not any(c.isdigit() for c in new_password):
+        print("[BACKEND auth] Error: bad_password")
+        return JSONResponse({"ok": False, "reason": "bad_password"}, status_code=400)
+
+    with db() as con:
+        user = con.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+        if not user:
+            print(f"[BACKEND auth] Error: not_found")
+            return JSONResponse({"ok": False, "reason": "not_found"}, status_code=400)
+
+        user_id = int(user["id"])
+        now = now_ts()
+
+        # Verify code (valid for 10 minutes)
+        code_row = con.execute(
+            "SELECT id FROM email_codes WHERE user_id=? AND code=? AND created_ts > ? ORDER BY created_ts DESC LIMIT 1",
+            (user_id, code, now - 600)
+        ).fetchone()
+
+        if not code_row:
+            print("[BACKEND auth] Error: invalid_code")
+            return JSONResponse({"ok": False, "reason": "invalid_code"}, status_code=400)
+
+        # Update password
+        pwd_hash = hash_password(new_password)
+        con.execute("UPDATE users SET password_hash=? WHERE id=?", (pwd_hash, user_id))
+
+        # Delete used code
+        con.execute("DELETE FROM email_codes WHERE id=?", (int(code_row["id"]),))
+
+        print("[BACKEND auth] Password reset successful")
+
+    return JSONResponse({"ok": True, "status": "password_reset"})
+
+
+# =========================================================
+# Ban / Support / Admin API (MVP)
+# =========================================================
+@app.post("/api/app/ban_status")
+async def app_ban_status(tag: str = Depends(session_dep)):
+    now = now_ts()
+    with db() as con:
+        active = _get_active_ban_row(con, tag, now)
+        if active:
+            _sync_users_banned_from_user_bans(con, tag, now)
+            payload = _ban_payload_from_row(active, now)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    **payload,
+                    "support": {
+                        "chat_handle": SUPPORT_CHAT_HANDLE,
+                        "message": f"Ты заблокирован. Причина: {payload['reason']}. Обжалуй/задай вопрос в поддержку: {SUPPORT_CHAT_HANDLE}",
+                    },
+                }
+            )
+
+        # Keep response shape stable for the frontend.
+        _sync_users_banned_from_user_bans(con, tag, now)
+        return JSONResponse(
+            {
+                "ok": True,
+                "banned": False,
+                "is_permanent": False,
+                "reason": "",
+                "remaining_seconds": 0,
+                "expires_ts": 0,
+                "support": {"chat_handle": SUPPORT_CHAT_HANDLE, "message": ""},
+            }
+        )
+
+
+@app.post("/api/support/ticket_create")
+async def support_ticket_create(req: Request, tag: str = Depends(session_dep)):
+    body = await req.json()
+    msg = (body.get("message") or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "reason": "bad_message"}, status_code=400)
+
+    now = now_ts()
+    with db() as con:
+        cur = con.execute(
+            f"""
+            INSERT INTO support_tickets(from_tag, status, created_ts, updated_ts)
+            VALUES (%s,%s,%s,%s)
+            {_returning_id() if _use_postgres else ""}
+            """,
+            (tag, "open", now, now),
+        )
+        if _use_postgres:
+            row = cur.fetchone()
+            ticket_id = int(row[0] if row else 0)
+        else:
+            ticket_id = int(cur.lastrowid or 0)
+        con.execute(
+            """
+            INSERT INTO support_messages(ticket_id, from_tag, body, created_ts)
+            VALUES (?,?,?,?)
+            """,
+            (ticket_id, tag, msg, now),
+        )
+        con.commit()
+
+    # Notify admin via lobby WS
+    if ADMIN_EMAIL:
+        with db() as con2:
+            admin_row = con2.execute("SELECT tag FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+        if admin_row:
+            await lobby_hub.send_to(str(admin_row["tag"]), {
+                "type": "support_new_ticket",
+                "data": {"ticket_id": ticket_id, "from_tag": tag},
+            })
+
+    return JSONResponse({"ok": True, "ticket_id": ticket_id})
+
+
+@app.post("/api/support/ticket_reply")
+async def support_ticket_reply(req: Request, tag: str = Depends(session_dep)):
+    body = await req.json()
+    ticket_id = body.get("ticket_id")
+    msg = (body.get("message") or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "reason": "bad_message"}, status_code=400)
+    try:
+        ticket_id_i = int(ticket_id)
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "bad_ticket_id"}, status_code=400)
+
+    now = now_ts()
+    with db() as con:
+        ticket = con.execute("SELECT id, from_tag FROM support_tickets WHERE id=?", (ticket_id_i,)).fetchone()
+        if not ticket:
+            return JSONResponse({"ok": False, "reason": "ticket_not_found"}, status_code=400)
+        if str(ticket["from_tag"]) != tag:
+            return JSONResponse({"ok": False, "reason": "not_allowed"}, status_code=403)
+
+        con.execute(
+            """
+            INSERT INTO support_messages(ticket_id, from_tag, body, created_ts)
+            VALUES (?,?,?,?)
+            """,
+            (ticket_id_i, tag, msg, now),
+        )
+        con.execute("UPDATE support_tickets SET updated_ts=? WHERE id=?", (now, ticket_id_i))
+        con.commit()
+
+    # Notify admin via lobby WS
+    if ADMIN_EMAIL:
+        with db() as con2:
+            admin_row = con2.execute("SELECT tag FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+        if admin_row:
+            await lobby_hub.send_to(str(admin_row["tag"]), {
+                "type": "support_new_message",
+                "data": {"ticket_id": ticket_id_i, "from_tag": tag},
+            })
+
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/support/ticket_list")
+async def support_ticket_list(tag: str = Depends(session_dep)):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT id, status, created_ts, updated_ts
+            FROM support_tickets
+            WHERE from_tag=?
+            ORDER BY updated_ts DESC, id DESC
+            """,
+            (tag,),
+        ).fetchall()
+
+    tickets = []
+    for r in rows:
+        tickets.append(
+            {
+                "ticket_id": int(r["id"]),
+                "status": str(r["status"] or "open"),
+                "created_ts": int(r["created_ts"] or 0),
+                "updated_ts": int(r["updated_ts"] or 0),
+            }
+        )
+    return JSONResponse({"ok": True, "tickets": tickets})
+
+
+@app.post("/api/support/ticket_messages")
+async def support_ticket_messages(req: Request, tag: str = Depends(session_dep)):
+    body = await req.json()
+    ticket_id = body.get("ticket_id")
+    try:
+        ticket_id_i = int(ticket_id)
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "bad_ticket_id"}, status_code=400)
+
+    now = now_ts()
+    with db() as con:
+        ticket = con.execute(
+            "SELECT id, from_tag, status FROM support_tickets WHERE id=?",
+            (ticket_id_i,),
+        ).fetchone()
+        if not ticket:
+            return JSONResponse({"ok": False, "reason": "ticket_not_found"}, status_code=400)
+        if str(ticket["from_tag"]) != tag:
+            return JSONResponse({"ok": False, "reason": "not_allowed"}, status_code=403)
+        msgs = con.execute(
+            """
+            SELECT id, from_tag, body, created_ts
+            FROM support_messages
+            WHERE ticket_id=?
+            ORDER BY created_ts ASC, id ASC
+            """,
+            (ticket_id_i,),
+        ).fetchall()
+
+    messages = []
+    for m in msgs:
+        messages.append(
+            {
+                "id": int(m["id"]),
+                "from_tag": str(m["from_tag"]),
+                "body": str(m["body"]),
+                "created_ts": int(m["created_ts"] or 0),
+            }
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "ticket_id": ticket_id_i,
+            "status": str(ticket["status"] or "open"),
+            "messages": messages,
+        }
+    )
+
+
+@app.post("/api/admin/users_search")
+async def admin_users_search(req: Request, admin_tag: str = Depends(admin_only_dep)):
+    body = await req.json()
+    q = (body.get("query") or "").strip()
+    if not q:
+        return JSONResponse({"ok": False, "reason": "bad_query"}, status_code=400)
+
+    q_low = q.lower()
+    tag_exact = None
+    if q_low.startswith("@"):
+        tag_exact = norm_tag(q_low)
+
+    limit = 50
+    with db() as con:
+        if tag_exact:
+            row = con.execute("SELECT tag, nickname, elo, banned FROM users WHERE tag=?", (tag_exact,)).fetchone()
+            if not row:
+                return JSONResponse({"ok": True, "users": []})
+            users = [
+                {
+                    "tag": str(row["tag"]),
+                    "nickname": str(row["nickname"]),
+                    "elo": int(row["elo"] or 0),
+                    "is_admin": _is_tag_admin(con, str(row["tag"])),
+                }
+            ]
+            return JSONResponse({"ok": True, "users": users})
+
+        rows = con.execute(
+            """
+            SELECT tag, nickname, elo, banned
+            FROM users
+            WHERE LOWER(nickname) LIKE ?
+               OR LOWER(tag) LIKE ?
+            ORDER BY elo DESC, nickname ASC
+            LIMIT ?
+            """,
+            (f"%{q_low}%", f"%{q_low}%", limit),
+        ).fetchall()
+
+        users = []
+        for r in rows:
+            users.append(
+                {
+                    "tag": str(r["tag"]),
+                    "nickname": str(r["nickname"]),
+                    "elo": int(r["elo"] or 0),
+                    "is_admin": _is_tag_admin(con, str(r["tag"])),
+                }
+            )
+    return JSONResponse({"ok": True, "users": users})
+
+
+@app.post("/api/admin/ban_quick")
+async def admin_ban_quick(req: Request, admin_tag: str = Depends(admin_only_dep)):
+    body = await req.json()
+    raw_tag = (body.get("tag") or "").strip()
+    if not raw_tag:
+        return JSONResponse({"ok": False, "reason": "bad_tag"}, status_code=400)
+    tag = norm_tag(raw_tag)
+
+    duration_type = (body.get("duration_type") or "").strip().lower()
+    reason = _norm_admin_reason(body.get("reason") or "")
+    now = now_ts()
+
+    if duration_type not in ("seconds", "permanent"):
+        return JSONResponse({"ok": False, "reason": "bad_duration_type"}, status_code=400)
+
+    expires_ts = 0
+    if duration_type == "seconds":
+        try:
+            duration_seconds = int(body.get("duration_seconds"))
+        except Exception:
+            return JSONResponse({"ok": False, "reason": "bad_duration_seconds"}, status_code=400)
+        if duration_seconds <= 0:
+            return JSONResponse({"ok": False, "reason": "bad_duration_seconds"}, status_code=400)
+        expires_ts = now + duration_seconds
+
+    with db() as con:
+        user = con.execute("SELECT tag FROM users WHERE tag=?", (tag,)).fetchone()
+        if not user:
+            return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+
+        # Revoke existing active bans for this tag.
+        con.execute(
+            """
+            UPDATE user_bans
+            SET revoked_ts=?
+            WHERE tag=?
+              AND revoked_ts IS NULL
+              AND (expires_ts=0 OR expires_ts>?)
+            """,
+            (now, tag, now),
+        )
+
+        con.execute(
+            """
+            INSERT INTO user_bans(tag, reason, created_ts, expires_ts, revoked_ts, created_by_tag)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (tag, reason, now, int(expires_ts), None, admin_tag),
+        )
+        con.execute("UPDATE users SET banned=1 WHERE tag=?", (tag,))
+        con.commit()
+
+    # Notify banned user via lobby WS
+    await lobby_hub.send_to(tag, {
+        "type": "ban_status_changed",
+        "data": {"banned": True, "reason": reason},
+    })
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "banned": True,
+            "is_permanent": bool(expires_ts == 0),
+            "expires_ts": int(expires_ts),
+            "reason": reason,
+        }
+    )
+
+
+
+@app.post("/api/admin/unban")
+async def admin_unban(req: Request, admin_tag: str = Depends(admin_only_dep)):
+    body = await req.json()
+    raw_tag = (body.get("tag") or "").strip()
+    if not raw_tag:
+        return JSONResponse({"ok": False, "reason": "bad_tag"}, status_code=400)
+    tag = norm_tag(raw_tag)
+    now = now_ts()
+
+    with db() as con:
+        user = con.execute("SELECT tag FROM users WHERE tag=?", (tag,)).fetchone()
+        if not user:
+            return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+
+        con.execute(
+            """
+            UPDATE user_bans
+            SET revoked_ts=?
+            WHERE tag=?
+              AND revoked_ts IS NULL
+            """,
+            (now, tag),
+        )
+        con.execute("UPDATE users SET banned=0 WHERE tag=?", (tag,))
+        con.commit()
+
+    # Notify unbanned user via lobby WS
+    await lobby_hub.send_to(tag, {
+        "type": "ban_status_changed",
+        "data": {"banned": False},
+    })
+
+    return JSONResponse({"ok": True, "unbanned_tag": tag})
+
+
+@app.post("/api/admin/support_ticket_list")
+async def admin_support_ticket_list(admin_tag: str = Depends(admin_only_dep)):
+    now = now_ts()
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT id, from_tag, status, created_ts, updated_ts
+            FROM support_tickets
+            ORDER BY updated_ts DESC, id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+
+        tickets = []
+        for r in rows:
+            from_tag = str(r["from_tag"])
+            ban_info = None
+            active_ban = _get_active_ban_row(con, from_tag, now)
+            if active_ban:
+                ban_info = _ban_payload_from_row(active_ban, now)
+
+            tickets.append(
+                {
+                    "ticket_id": int(r["id"]),
+                    "from_tag": from_tag,
+                    "status": str(r["status"] or "open"),
+                    "created_ts": int(r["created_ts"] or 0),
+                    "updated_ts": int(r["updated_ts"] or 0),
+                    "ban_info": ban_info,
+                }
+            )
+    return JSONResponse({"ok": True, "tickets": tickets})
+
+
+@app.post("/api/admin/support_ticket_messages")
+async def admin_support_ticket_messages(req: Request, admin_tag: str = Depends(admin_only_dep)):
+    body = await req.json()
+    ticket_id = body.get("ticket_id")
+    try:
+        ticket_id_i = int(ticket_id)
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "bad_ticket_id"}, status_code=400)
+
+    with db() as con:
+        ticket = con.execute(
+            "SELECT id, from_tag, status FROM support_tickets WHERE id=?",
+            (ticket_id_i,),
+        ).fetchone()
+        if not ticket:
+            return JSONResponse({"ok": False, "reason": "ticket_not_found"}, status_code=400)
+        msgs = con.execute(
+            """
+            SELECT id, from_tag, body, created_ts
+            FROM support_messages
+            WHERE ticket_id=?
+            ORDER BY created_ts ASC, id ASC
+            """,
+            (ticket_id_i,),
+        ).fetchall()
+
+    messages = []
+    for m in msgs:
+        messages.append(
+            {
+                "id": int(m["id"]),
+                "from_tag": str(m["from_tag"]),
+                "body": str(m["body"]),
+                "created_ts": int(m["created_ts"] or 0),
+            }
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "ticket_id": ticket_id_i,
+            "status": str(ticket["status"] or "open"),
+            "messages": messages,
+        }
+    )
+
+
+@app.post("/api/admin/support_reply")
+async def admin_support_reply(req: Request, admin_tag: str = Depends(admin_only_dep)):
+    body = await req.json()
+    ticket_id = body.get("ticket_id")
+    msg = (body.get("message") or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "reason": "bad_message"}, status_code=400)
+    try:
+        ticket_id_i = int(ticket_id)
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "bad_ticket_id"}, status_code=400)
+
+    ticket_owner_tag: Optional[str] = None
+    now = now_ts()
+    with db() as con:
+        ticket = con.execute("SELECT id, from_tag FROM support_tickets WHERE id=?", (ticket_id_i,)).fetchone()
+        if not ticket:
+            return JSONResponse({"ok": False, "reason": "ticket_not_found"}, status_code=400)
+        ticket_owner_tag = str(ticket["from_tag"])
+
+        con.execute(
+            """
+            INSERT INTO support_messages(ticket_id, from_tag, body, created_ts)
+            VALUES (?,?,?,?)
+            """,
+            (ticket_id_i, admin_tag, msg, now),
+        )
+        con.execute("UPDATE support_tickets SET updated_ts=? WHERE id=?", (now, ticket_id_i))
+        con.commit()
+
+    # Notify ticket owner via lobby WS
+    if ticket_owner_tag:
+        await lobby_hub.send_to(ticket_owner_tag, {
+            "type": "support_new_message",
+            "data": {"ticket_id": ticket_id_i, "from_tag": admin_tag},
+        })
+
+    return JSONResponse({"ok": True})
+
+
+# =========================================================
+# LOBBY API
+# =========================================================
+@app.post("/api/lobby/online")
+async def lobby_online(tag: str = Depends(session_dep_ban_guard)):
+    with db() as con:
+        now = now_ts()
+        con.execute(
+            """
+            INSERT INTO lobby_online(tag, last_ts) VALUES (?,?)
+            ON CONFLICT(tag) DO UPDATE SET last_ts=excluded.last_ts
+            """,
+            (tag, now),
+        )
+        con.commit()
+
+        rows = con.execute("SELECT tag FROM lobby_online WHERE last_ts>=?", (now - 40,)).fetchall()
+
+        online = []
+        for row in rows:
+            u_tag = str(row["tag"])
+            user = con.execute("SELECT nickname, elo FROM users WHERE tag=?", (u_tag,)).fetchone()
+            if not user:
+                continue
+            if _get_active_ban_row(con, u_tag, now):
+                continue
+            online.append(
+                {
+                    "tag": u_tag,
+                    "nickname": str(user["nickname"]),
+                    "elo": int(user["elo"] or 0),
+                    "is_admin": _is_tag_admin(con, u_tag),
+                    "admin": "admin" if _is_tag_admin(con, u_tag) else "",
+                }
+            )
+    online.sort(key=lambda item: (-int(item["elo"]), str(item["nickname"]).lower()))
+    return JSONResponse({"ok": True, "online": online})
+
+
+def _cleanup_expired_invites(con: sqlite3.Connection) -> None:
+    now = now_ts()
+    con.execute(
+        """
+        UPDATE invites
+        SET status='expired', responded_ts=?
+        WHERE status='pending' AND expires_ts>0 AND expires_ts<?
+        """,
+        (now, now),
+    )
+
+
+def _invite_row_for_response(con: sqlite3.Connection, to_tag: str, body: Dict[str, Any]) -> Optional[sqlite3.Row]:
+    _cleanup_expired_invites(con)
+    invite_id_raw = body.get("invite_id")
+    if invite_id_raw not in (None, ""):
+        try:
+            invite_id = int(invite_id_raw)
+        except Exception:
+            return None
+        return con.execute(
+            """
+            SELECT * FROM invites
+            WHERE id=? AND to_tag=? AND status='pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (invite_id, to_tag),
+        ).fetchone()
+
+    from_tag = norm_tag(body.get("from_tag", ""))
+    minutes = int(body.get("minutes") or 10)
+    if minutes not in (10, 30, 60):
+        minutes = 10
+    if not from_tag:
+        return None
+    return con.execute(
+        """
+        SELECT * FROM invites
+        WHERE from_tag=? AND to_tag=? AND minutes=? AND status='pending'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (from_tag, to_tag, minutes),
+    ).fetchone()
+
+
+def _invite_missing_reason(con: sqlite3.Connection, to_tag: str, body: Dict[str, Any]) -> str:
+    invite_id_raw = body.get("invite_id")
+    if invite_id_raw not in (None, ""):
+        try:
+            invite_id = int(invite_id_raw)
+        except Exception:
+            return "bad_invite"
+        row = con.execute("SELECT status FROM invites WHERE id=? AND to_tag=?", (invite_id, to_tag)).fetchone()
+        if not row:
+            return "invite_not_found"
+        status = str(row["status"] or "")
+        if status == "expired":
+            return "invite_expired"
+        if status in ("accepted", "declined"):
+            return "invite_already_handled"
+        return "invite_not_found"
+
+    from_tag = norm_tag(body.get("from_tag", ""))
+    if not from_tag:
+        return "bad_invite"
+    row = con.execute(
+        "SELECT status FROM invites WHERE from_tag=? AND to_tag=? ORDER BY id DESC LIMIT 1",
+        (from_tag, to_tag),
+    ).fetchone()
+    if not row:
+        return "invite_not_found"
+    status = str(row["status"] or "")
+    if status == "expired":
+        return "invite_expired"
+    if status in ("accepted", "declined"):
+        return "invite_already_handled"
+    return "invite_not_found"
+
+
+def _mm_delta_elo(wait_seconds: int) -> int:
+    if wait_seconds < 0:
+        wait_seconds = 0
+    steps = wait_seconds // max(1, MM_STEP_SECONDS)
+    delta = MM_INITIAL_DELTA_ELO + int(steps) * MM_STEP_DELTA_ELO
+    return min(MM_MAX_DELTA_ELO, int(delta))
+
+
+def _mm_build_searching_payload(
+    elo_at_join: int,
+    created_ts: int,
+    minutes: int,
+    now: int,
+) -> Dict[str, Any]:
+    wait_seconds = max(0, int(now) - int(created_ts))
+    delta = _mm_delta_elo(wait_seconds)
+    return {
+        "in_queue": True,
+        "minutes": int(minutes),
+        "elo": int(elo_at_join),
+        "wait_seconds": int(wait_seconds),
+        "delta_elo": int(delta),
+    }
+
+
+def _mm_tag_has_active_game(con: sqlite3.Connection, tag: str) -> bool:
+    row = con.execute(
+        """
+        SELECT 1
+        FROM games
+        WHERE status='active' AND (w_tag=? OR b_tag=?)
+        LIMIT 1
+        """,
+        (tag, tag),
+    ).fetchone()
+    return bool(row)
+
+
+def _mm_tag_has_pending_invite(con: sqlite3.Connection, tag: str) -> bool:
+    row = con.execute(
+        """
+        SELECT 1
+        FROM invites
+        WHERE status='pending' AND (from_tag=? OR to_tag=?)
+        LIMIT 1
+        """,
+        (tag, tag),
+    ).fetchone()
+    return bool(row)
+
+
+def _mm_cleanup_expired_queue(con: sqlite3.Connection, now: int) -> None:
+    threshold = now - MM_QUEUE_TIMEOUT_SECONDS
+    con.execute(
+        "DELETE FROM matchmaking_queue WHERE created_ts<?",
+        (int(threshold),),
+    )
+
+
+def _mm_pick_candidate(
+    self_tag: str,
+    self_minutes: int,
+    self_elo_at_join: int,
+    self_created_ts: int,
+    now: int,
+    candidates: List[sqlite3.Row],
+) -> Optional[sqlite3.Row]:
+    self_wait = max(0, int(now) - int(self_created_ts))
+    self_delta = _mm_delta_elo(self_wait)
+    self_low = int(self_elo_at_join) - self_delta
+    self_high = int(self_elo_at_join) + self_delta
+
+    best: Optional[sqlite3.Row] = None
+    best_diff: Optional[int] = None
+
+    for c in candidates:
+        cand_tag = str(c["tag"])
+        if cand_tag == self_tag:
+            continue
+
+        cand_created_ts = int(c["created_ts"])
+        cand_wait = max(0, int(now) - cand_created_ts)
+        cand_delta = _mm_delta_elo(cand_wait)
+        cand_elo = int(c["elo_at_join"])
+        cand_low = cand_elo - cand_delta
+        cand_high = cand_elo + cand_delta
+
+        overlap = max(self_low, cand_low) <= min(self_high, cand_high)
+        if not overlap:
+            continue
+
+        diff = abs(int(self_elo_at_join) - cand_elo)
+        if best is None or diff < int(best_diff or diff):
+            best = c
+            best_diff = diff
+        elif best is not None and diff == int(best_diff or diff):
+            # Tie-breaker: prefer the older one (created_ts smaller)
+            if int(c["created_ts"]) < int(best["created_ts"]):
+                best = c
+                best_diff = diff
+
+    return best
+
+
+def _mm_norm_minutes(raw: Any) -> int:
+    try:
+        minutes = int(raw or 10)
+    except Exception:
+        minutes = 10
+    if minutes not in (10, 30, 60):
+        minutes = 10
+    return minutes
+
+
+def _mm_get_queue_row(con: sqlite3.Connection, tag: str) -> Optional[sqlite3.Row]:
+    return con.execute("SELECT * FROM matchmaking_queue WHERE tag=?", (tag,)).fetchone()
+
+
+def _mm_searching_from_queue_row(row: sqlite3.Row, now: int, *, in_queue: bool) -> Dict[str, Any]:
+    payload = _mm_build_searching_payload(
+        elo_at_join=int(row["elo_at_join"]),
+        created_ts=int(row["created_ts"]),
+        minutes=int(row["minutes"]),
+        now=int(now),
+    )
+    payload["in_queue"] = bool(in_queue)
+    return payload
+
+
+def _mm_upsert_queue_row(con: sqlite3.Connection, tag: str, minutes: int, elo_now: int, now: int) -> sqlite3.Row:
+    existing = _mm_get_queue_row(con, tag)
+    if existing and int(existing["minutes"]) == int(minutes):
+        return existing
+    con.execute(
+        """
+        INSERT INTO matchmaking_queue(tag, minutes, elo_at_join, created_ts)
+        VALUES (?,?,?,?)
+        ON CONFLICT(tag) DO UPDATE SET
+            minutes=excluded.minutes,
+            elo_at_join=excluded.elo_at_join,
+            created_ts=excluded.created_ts
+        """,
+        (tag, int(minutes), int(elo_now), int(now)),
+    )
+    row = _mm_get_queue_row(con, tag)
+    if not row:
+        fail(500, "mm_failed")
+    return row
+
+
+def _mm_list_candidates(con: sqlite3.Connection, minutes: int, self_tag: str) -> List[sqlite3.Row]:
+    return con.execute(
+        """
+        SELECT *
+        FROM matchmaking_queue
+        WHERE minutes=? AND tag<>?
+        ORDER BY created_ts ASC
+        """,
+        (int(minutes), self_tag),
+    ).fetchall()
+
+
+def _mm_try_match_on_con(con: sqlite3.Connection, self_tag: str, now: int) -> Optional[Dict[str, Any]]:
+    self_row = _mm_get_queue_row(con, self_tag)
+    if not self_row:
+        return None
+
+    candidates = _mm_list_candidates(con, int(self_row["minutes"]), self_tag)
+    best = _mm_pick_candidate(
+        self_tag=self_tag,
+        self_minutes=int(self_row["minutes"]),
+        self_elo_at_join=int(self_row["elo_at_join"]),
+        self_created_ts=int(self_row["created_ts"]),
+        now=int(now),
+        candidates=candidates,
+    )
+    if not best:
+        return None
+
+    other_tag = str(best["tag"])
+
+    # Re-check constraints for both sides right before creating a game.
+    if _mm_tag_has_active_game(con, self_tag) or _mm_tag_has_active_game(con, other_tag):
+        return None
+    if _mm_tag_has_pending_invite(con, self_tag) or _mm_tag_has_pending_invite(con, other_tag):
+        return None
+
+    cur = con.execute("DELETE FROM matchmaking_queue WHERE tag IN (?,?)", (self_tag, other_tag))
+    if int(cur.rowcount or 0) != 2:
+        return None
+
+    minutes = int(self_row["minutes"])
+    gid = create_game_on_con(con, w_tag=self_tag, b_tag=other_tag, minutes=minutes)
+
+    self_searching = _mm_searching_from_queue_row(self_row, now, in_queue=False)
+    other_searching = _mm_searching_from_queue_row(best, now, in_queue=False)
+
+    return {
+        "game_id": gid,
+        "w_tag": self_tag,
+        "b_tag": other_tag,
+        "minutes": minutes,
+        "searching_self": self_searching,
+        "searching_other": other_searching,
+    }
+
+
+@app.post("/api/lobby/invite")
+async def lobby_invite(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    to_tag = (body.get("to_tag") or "").strip()
+    minutes = int(body.get("minutes") or 10)
+    if minutes not in (10, 30, 60):
+        minutes = 10
+
+    with db() as con:
+        if not to_tag.startswith("@"):
+            if _use_postgres:
+                user_row = con.execute("SELECT tag, banned FROM users WHERE LOWER(nickname)=LOWER(%s)", (to_tag,)).fetchone()
+            else:
+                user_row = con.execute("SELECT tag, banned FROM users WHERE nickname=? COLLATE NOCASE", (to_tag,)).fetchone()
+            if not user_row:
+                return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+            to_tag = user_row["tag"]
+            is_banned = int(user_row["banned"]) == 1
+        else:
+            to_tag = norm_tag(to_tag)
+            user_row = con.execute("SELECT banned FROM users WHERE tag=?", (to_tag,)).fetchone()
+            if not user_row:
+                return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+            is_banned = int(user_row["banned"]) == 1
+
+    if to_tag == tag:
+        return JSONResponse({"ok": False, "reason": "self"}, status_code=400)
+
+    if is_banned:
+        return JSONResponse({"ok": False, "reason": "banned_user"}, status_code=400)
+
+    invite_id = 0
+    with db() as con:
+        created = now_ts()
+        expires = created + max(30, INVITE_TTL_SECONDS)
+        cur = con.execute(
+            f"""
+            INSERT INTO invites(from_tag, to_tag, minutes, created_ts, status, expires_ts, responded_ts)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            {_returning_id() if _use_postgres else ""}
+            """,
+            (tag, to_tag, minutes, created, "pending", expires, None),
+        )
+        if _use_postgres:
+            row = cur.fetchone()
+            invite_id = int(row[0] if row else 0)
+        else:
+            invite_id = int(cur.lastrowid or 0)
+        con.commit()
+
+    me = get_user(tag)
+    await lobby_hub.send_to(
+        to_tag,
+        {
+            "type": "invite",
+            "data": {
+                "from_tag": tag,
+                "from_nick": str(me["nickname"]) if me else tag,
+                "from_elo": int(me["elo"] or 0) if me else 0,
+                "minutes": minutes,
+                "invite_id": invite_id,
+            },
+        },
+    )
+    return JSONResponse({"ok": True, "invite_id": invite_id})
+
+
+@app.post("/api/lobby/invite_accept")
+async def lobby_invite_accept(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    with db() as con:
+        invite = _invite_row_for_response(con, tag, body)
+        if not invite:
+            return JSONResponse({"ok": False, "reason": _invite_missing_reason(con, tag, body)}, status_code=400)
+        if int(invite["expires_ts"] or 0) < now_ts():
+            con.execute("UPDATE invites SET status='expired', responded_ts=? WHERE id=?", (now_ts(), int(invite["id"])))
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "invite_expired"}, status_code=400)
+
+        from_tag = str(invite["from_tag"])
+        minutes = int(invite["minutes"])
+        if not get_user(from_tag):
+            return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+        cur = con.execute(
+            "UPDATE invites SET status='accepted', responded_ts=? WHERE id=? AND status='pending'",
+            (now_ts(), int(invite["id"])),
+        )
+        if int(cur.rowcount or 0) != 1:
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "invite_already_handled"}, status_code=400)
+        con.commit()
+
+    gid = create_game(from_tag, tag, minutes)
+    payload = {"type": "game_created", "data": {"game_id": gid, "w_tag": from_tag, "b_tag": tag}}
+    await lobby_hub.send_to(from_tag, payload)
+    await lobby_hub.send_to(tag, payload)
+    return JSONResponse({"ok": True, "game_id": gid})
+
+
+@app.post("/api/lobby/invite_decline")
+async def lobby_invite_decline(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    with db() as con:
+        invite = _invite_row_for_response(con, tag, body)
+        if not invite:
+            return JSONResponse({"ok": False, "reason": _invite_missing_reason(con, tag, body)}, status_code=400)
+        from_tag = str(invite["from_tag"])
+        cur = con.execute(
+            "UPDATE invites SET status='declined', responded_ts=? WHERE id=? AND status='pending'",
+            (now_ts(), int(invite["id"])),
+        )
+        if int(cur.rowcount or 0) != 1:
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "invite_already_handled"}, status_code=400)
+        con.commit()
+    await lobby_hub.send_to(from_tag, {"type": "invite_declined", "data": {"to_tag": tag}})
+    return JSONResponse({"ok": True})
+
+
+# =========================================================
+# MATCHMAKING API
+# =========================================================
+@app.get("/api/lobby/leaderboard")
+async def lobby_leaderboard(_: str = Depends(session_dep_ban_guard)):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT tag, nickname, elo, games_played
+            FROM users
+            WHERE email_verified = 1
+            ORDER BY elo DESC, id ASC
+            LIMIT 50
+            """
+        ).fetchall()
+        
+        leaderboard = []
+        for i, r in enumerate(rows):
+            # Win rate and streak could be calculated from game_results if needed, 
+            # but for MVP we'll return basics and games played.
+            leaderboard.append({
+                "rank": i + 1,
+                "username": r["nickname"],
+                "tag": r["tag"],
+                "elo": r["elo"],
+                "games": r["games_played"],
+                "wins": 0, # placeholder or calculate
+                "losses": 0, # placeholder
+                "winRate": 0, # placeholder
+                "streak": 0 # placeholder
+            })
+        
+        return {"ok": True, "leaderboard": leaderboard}
+
+
+@app.get("/api/lobby/active_games")
+async def lobby_active_games(tag: str = Depends(session_dep_ban_guard)):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT game_id, w_tag, b_tag, minutes, server_ts 
+            FROM games 
+            WHERE status='active'
+            ORDER BY server_ts DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        
+        games = []
+        for r in rows:
+            w_u = _get_user_info(con, r["w_tag"])
+            b_u = _get_user_info(con, r["b_tag"])
+            if not w_u or not b_u:
+                continue
+            games.append({
+                "game_id": str(r["game_id"]),
+                "w_nickname": w_u["nickname"],
+                "w_elo": w_u["elo"],
+                "b_nickname": b_u["nickname"],
+                "b_elo": b_u["elo"],
+                "minutes": int(r["minutes"]),
+                "started_ts": int(r["server_ts"])
+            })
+            
+    return JSONResponse({"ok": True, "games": games})
+
+@app.post("/api/lobby/matchmaking_start")
+async def lobby_matchmaking_start(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    minutes = _mm_norm_minutes(body.get("minutes"))
+    now = now_ts()
+
+    user = get_user(tag)
+    if not user:
+        return JSONResponse({"ok": False, "reason": "no_user"}, status_code=400)
+    elo_now = int(user["elo"] or 0)
+
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        _mm_cleanup_expired_queue(con, now)
+
+        if _mm_tag_has_active_game(con, tag):
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "in_game"}, status_code=400)
+        if _mm_tag_has_pending_invite(con, tag):
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "invite_in_progress"}, status_code=400)
+
+        self_row = _mm_upsert_queue_row(con, tag, minutes, elo_now, now)
+        if not isinstance(self_row, sqlite3.Row):
+            self_row = _mm_get_queue_row(con, tag)
+        if not self_row:
+            con.commit()
+            return JSONResponse({"ok": False, "reason": "mm_failed"}, status_code=500)
+
+        matched = _mm_try_match_on_con(con, tag, now)
+        if matched:
+            con.commit()
+        else:
+            con.commit()
+
+    if matched:
+        payload_game = {"type": "game_created", "data": {"game_id": matched["game_id"], "w_tag": matched["w_tag"], "b_tag": matched["b_tag"]}}
+        await lobby_hub.send_to(matched["w_tag"], payload_game)
+        await lobby_hub.send_to(matched["b_tag"], payload_game)
+
+        # Ensure both players are informed matchmaking ended.
+        payload_mm_w = {"type": "matchmaking", "data": {"searching": matched["searching_self"]}}
+        payload_mm_b = {"type": "matchmaking", "data": {"searching": matched["searching_other"]}}
+        await lobby_hub.send_to(matched["w_tag"], payload_mm_w)
+        await lobby_hub.send_to(matched["b_tag"], payload_mm_b)
+
+        return JSONResponse({"ok": True, "searching": matched["searching_self"]})
+
+    return JSONResponse({"ok": True, "searching": _mm_searching_from_queue_row(self_row, now, in_queue=True)})
+
+
+@app.post("/api/lobby/matchmaking_cancel")
+async def lobby_matchmaking_cancel(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    _ = await req.json()
+    now = now_ts()
+
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = _mm_get_queue_row(con, tag)
+        con.execute("DELETE FROM matchmaking_queue WHERE tag=?", (tag,))
+        con.commit()
+
+    if row:
+        searching = _mm_searching_from_queue_row(row, now, in_queue=False)
+    else:
+        user = get_user(tag)
+        elo_now = int(user["elo"] or 0) if user else 0
+        searching = {
+            "in_queue": False,
+            "minutes": 10,
+            "elo": elo_now,
+            "wait_seconds": 0,
+            "delta_elo": _mm_delta_elo(0),
+        }
+
+    await lobby_hub.send_to(tag, {"type": "matchmaking", "data": {"searching": searching}})
+    return JSONResponse({"ok": True, "searching": searching})
+
+
+# =========================================================
+# GAME API
+# =========================================================
+@app.post("/api/game/get")
+async def game_get(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        # Allow spectators (anyone with a valid session) to view any game
+        row = refresh_game_row(con, row)
+        return JSONResponse({"ok": True, "game": row_to_game(row, tag)})
+
+
+@app.post("/api/game/legals")
+async def game_legals(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+    frm = (body.get("from") or "").strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row["w_tag"], row["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+        row = refresh_game_row(con, row)
+
+    you = "w" if row["w_tag"] == tag else "b"
+    if row["status"] != "active" or row["turn"] != you:
+        return JSONResponse({"ok": True, "dests": []})
+    if int(row["moved_this_turn"]) == 1:
+        return JSONResponse({"ok": True, "dests": []})
+
+    board = chess.Board(str(row["fen"]))
+    try:
+        from_sq = chess.parse_square(frm)
+    except Exception:
+        return JSONResponse({"ok": True, "dests": []})
+
+    piece = board.piece_at(from_sq)
+    if not piece or piece.color != (you == "w"):
+        return JSONResponse({"ok": True, "dests": []})
+
+    dests = []
+    for mv in board.legal_moves:
+        if mv.from_square == from_sq:
+            dests.append(chess.square_name(mv.to_square))
+    return JSONResponse({"ok": True, "dests": dests})
+
+
+@app.post("/api/game/move")
+async def game_move(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+    uci = (body.get("uci") or "").strip().lower()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        you = "w" if row["w_tag"] == tag else "b"
+        if row["status"] != "active" or row["turn"] != you:
+            return JSONResponse({"ok": False, "reason": "not_your_turn"}, status_code=400)
+        if int(row["moved_this_turn"]) == 1:
+            return JSONResponse({"ok": False, "reason": "already_moved"}, status_code=400)
+
+        board = chess.Board(str(row["fen"]))
+
+        try:
+            mv = chess.Move.from_uci(uci)
+        except Exception:
+            return JSONResponse({"ok": False, "reason": "bad_uci"}, status_code=400)
+        if mv not in board.legal_moves:
+            return JSONResponse({"ok": False, "reason": "illegal"}, status_code=400)
+
+        mover = board.piece_at(mv.from_square)
+        if not mover or mover.color != (you == "w"):
+            return JSONResponse({"ok": False, "reason": "wrong_piece"}, status_code=400)
+
+        captured = None
+        captured_sq_name = ""
+        if board.is_en_passant(mv):
+            cap_sq = chess.square(chess.square_file(mv.to_square), chess.square_rank(mv.from_square))
+            captured = board.piece_at(cap_sq)
+            captured_sq_name = chess.square_name(cap_sq)
+        else:
+            captured = board.piece_at(mv.to_square)
+            captured_sq_name = chess.square_name(mv.to_square)
+
+        gain2 = 2
+        bounty2 = 0
+        if board.is_capture(mv) and mover and captured:
+            gain2 += capture_bonus2(mover, captured)
+            # Bounty system: check if captured piece was purchased
+            bounty2 = _check_bounty_on_capture(row, captured_sq_name, you)
+            gain2 += bounty2
+
+        # Track purchased piece movement
+        from_sq_name = chess.square_name(mv.from_square)
+        to_sq_name = chess.square_name(mv.to_square)
+        _update_purchased_map_on_move(row, from_sq_name, to_sq_name, you)
+
+        board.push(mv)
+        row["fen"] = board.fen()
+        row["draw_offer_by"] = ""
+        row["last_move_from"] = from_sq_name
+        row["last_move_to"] = to_sq_name
+
+        if you == "w":
+            row["coins2_w"] = int(row["coins2_w"]) + gain2
+            row["consecutive_pass_w"] = 0
+        else:
+            row["coins2_b"] = int(row["coins2_b"]) + gain2
+            row["consecutive_pass_b"] = 0
+
+        row["moved_this_turn"] = 1
+        finish_if_needed_inplace(row)
+        save_game_state(con, row)
+        if row["status"] == "finished":
+            _finalize_game(con, row)
+        con.commit()
+
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state" if gpub["status"] == "active" else "finished", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/drop_targets")
+async def game_drop_targets(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+    piece = (body.get("piece") or "").lower().strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row["w_tag"], row["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+        row = refresh_game_row(con, row)
+
+    you = "w" if row["w_tag"] == tag else "b"
+    if row["status"] != "active" or row["turn"] != you:
+        return JSONResponse({"ok": True, "targets": []})
+    if piece not in BASE_COSTS2:
+        return JSONResponse({"ok": True, "targets": []})
+
+    board = chess.Board(str(row["fen"]))
+    targets = legal_drop_targets(board, you == "w", piece)
+    return JSONResponse({"ok": True, "targets": sorted(list(targets))})
+
+
+@app.post("/api/game/drop")
+async def game_drop(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+    piece = (body.get("piece") or "").lower().strip()
+    sqname = (body.get("square") or "").strip().lower()
+
+    if piece not in BASE_COSTS2:
+        return JSONResponse({"ok": False, "reason": "bad_piece"}, status_code=400)
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        you = "w" if row["w_tag"] == tag else "b"
+        if row["status"] != "active" or row["turn"] != you:
+            return JSONResponse({"ok": False, "reason": "not_your_turn"}, status_code=400)
+
+        board = chess.Board(str(row["fen"]))
+        targets = legal_drop_targets(board, you == "w", piece)
+        if sqname not in targets:
+            return JSONResponse({"ok": False, "reason": "bad_square"}, status_code=400)
+
+        base2 = BASE_COSTS2[piece]
+        extra2 = int(row["post_buy_extra2_w"] if you == "w" else row["post_buy_extra2_b"])
+        price2 = base2 + extra2
+        coins2 = int(row["coins2_w"] if you == "w" else row["coins2_b"])
+        if coins2 < price2:
+            return JSONResponse({"ok": False, "reason": "no_money"}, status_code=400)
+
+        try:
+            sq = chess.parse_square(sqname)
+        except Exception:
+            return JSONResponse({"ok": False, "reason": "bad_square"}, status_code=400)
+
+        ptype = piece_type_from_char(piece)
+        if ptype is None:
+            return JSONResponse({"ok": False, "reason": "bad_piece"}, status_code=400)
+
+        board.set_piece_at(sq, chess.Piece(ptype, you == "w"))
+        row["fen"] = board.fen()
+        row["draw_offer_by"] = ""
+        row["last_move_from"] = ""
+        row["last_move_to"] = sqname
+
+        if you == "w":
+            row["coins2_w"] = coins2 - price2
+            row["consecutive_pass_w"] = 0
+        else:
+            row["coins2_b"] = coins2 - price2
+            row["consecutive_pass_b"] = 0
+
+        # Economy tracking
+        spent_key = f"coins_spent_{you}"
+        row[spent_key] = int(row.get(spent_key) or 0) + price2
+        bought_key = f"pieces_bought_{you}"
+        row[bought_key] = int(row.get(bought_key) or 0) + 1
+
+        # Track purchased piece for bounty system
+        pmap = _get_purchased_map(row, you)
+        pmap[sqname] = piece
+        _set_purchased_map(row, you, pmap)
+
+        row["bought_this_turn"] = 1
+        if int(row["moved_this_turn"]) == 1:
+            row["bought_after_move"] = 1
+            if you == "w":
+                row["post_buy_extra2_w"] = int(row["post_buy_extra2_w"]) + 1
+            else:
+                row["post_buy_extra2_b"] = int(row["post_buy_extra2_b"]) + 1
+
+        save_game_state(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/end_turn")
+async def game_end_turn(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        you = "w" if row["w_tag"] == tag else "b"
+        if row["status"] != "active" or row["turn"] != you:
+            return JSONResponse({"ok": False, "reason": "not_your_turn"}, status_code=400)
+
+        moved = int(row["moved_this_turn"])
+        bought = int(row["bought_this_turn"])
+        bought_after_move = int(row["bought_after_move"])
+        row["draw_offer_by"] = ""
+
+        if moved == 1 and bought_after_move == 1:
+            if you == "w":
+                row["coins2_w"] = max(0, int(row["coins2_w"]) - 1)
+            else:
+                row["coins2_b"] = max(0, int(row["coins2_b"]) - 1)
+
+        if moved == 0 and bought == 1:
+            if you == "w":
+                row["coins2_w"] = int(row["coins2_w"]) + 1
+            else:
+                row["coins2_b"] = int(row["coins2_b"]) + 1
+
+        if moved == 0 and bought == 0:
+            if you == "w":
+                row["consecutive_pass_w"] = int(row["consecutive_pass_w"]) + 1
+                if row["consecutive_pass_w"] >= 3:
+                    row["status"] = "finished"
+                    row["result_json"] = json.dumps({"winner": "b", "reason": "3_passes"})
+            else:
+                row["consecutive_pass_b"] = int(row["consecutive_pass_b"]) + 1
+                if row["consecutive_pass_b"] >= 3:
+                    row["status"] = "finished"
+                    row["result_json"] = json.dumps({"winner": "w", "reason": "3_passes"})
+
+        if row["status"] == "active":
+            row["turn"] = "b" if you == "w" else "w"
+            if moved == 0:
+                board = chess.Board(str(row["fen"]))
+                board.turn = not board.turn
+                board.clear_stack()
+                row["fen"] = board.fen()
+
+        row["moved_this_turn"] = 0
+        row["bought_this_turn"] = 0
+        row["bought_after_move"] = 0
+        if you == "w":
+            row["post_buy_extra2_w"] = 0
+        else:
+            row["post_buy_extra2_b"] = 0
+
+        finish_if_needed_inplace(row)
+        save_game_state(con, row)
+        if row["status"] == "finished":
+            _finalize_game(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state" if gpub["status"] == "active" else "finished", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/resign")
+async def game_resign(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        if row["status"] != "active":
+            gpub = row_to_game(load_game_row(con, gid), tag)
+            return JSONResponse({"ok": True, "game": gpub})
+
+        winner = "b" if row["w_tag"] == tag else "w"
+        row["status"] = "finished"
+        row["draw_offer_by"] = ""
+        row["result_json"] = json.dumps({"winner": winner, "reason": "resign"})
+        save_game_state(con, row)
+        _finalize_game(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "finished", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/draw_offer")
+async def game_draw_offer(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        if row["status"] != "active":
+            return JSONResponse({"ok": False, "reason": "not_active"}, status_code=400)
+
+        you = "w" if row["w_tag"] == tag else "b"
+        row["draw_offer_by"] = you
+        save_game_state(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/draw_accept")
+async def game_draw_accept(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        if row["status"] != "active":
+            return JSONResponse({"ok": False, "reason": "not_active"}, status_code=400)
+
+        you = "w" if row["w_tag"] == tag else "b"
+        offer_by = str(row.get("draw_offer_by") or "")
+        if not offer_by or offer_by == you:
+            return JSONResponse({"ok": False, "reason": "no_offer"}, status_code=400)
+
+        row["status"] = "finished"
+        row["draw_offer_by"] = ""
+        row["result_json"] = json.dumps({"winner": "", "reason": "draw_agreed"})
+        save_game_state(con, row)
+        _finalize_game(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "finished", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/draw_decline")
+async def game_draw_decline(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row_db["w_tag"], row_db["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row = dict(refresh_game_row(con, row_db))
+        if row["status"] != "active":
+            return JSONResponse({"ok": False, "reason": "not_active"}, status_code=400)
+
+        you = "w" if row["w_tag"] == tag else "b"
+        offer_by = str(row.get("draw_offer_by") or "")
+        if not offer_by or offer_by == you:
+            return JSONResponse({"ok": False, "reason": "no_offer"}, status_code=400)
+
+        row["draw_offer_by"] = ""
+        save_game_state(con, row)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/rematch_offer")
+async def game_rematch_offer(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row["w_tag"], row["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row_dict = dict(row)
+        if row_dict["status"] != "finished":
+            return JSONResponse({"ok": False, "reason": "not_finished"}, status_code=400)
+
+        you = "w" if row_dict["w_tag"] == tag else "b"
+        row_dict["rematch_offer_by"] = you
+        save_game_state(con, row_dict)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+@app.post("/api/game/rematch_accept")
+async def game_rematch_accept(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row["w_tag"], row["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row_dict = dict(row)
+        if row_dict["status"] != "finished":
+            return JSONResponse({"ok": False, "reason": "not_finished"}, status_code=400)
+
+        you = "w" if row_dict["w_tag"] == tag else "b"
+        offer_by = str(row_dict.get("rematch_offer_by") or "")
+        if not offer_by or offer_by == you:
+            return JSONResponse({"ok": False, "reason": "no_offer"}, status_code=400)
+
+        new_gid = create_game(str(row_dict["w_tag"]), str(row_dict["b_tag"]), int(row_dict["minutes"]))
+        row_dict["rematch_offer_by"] = ""
+        save_game_state(con, row_dict)
+        con.commit()
+
+        payload = {
+            "type": "rematch_game_created",
+            "data": {
+                "game_id": new_gid,
+                "w_tag": row_dict["w_tag"],
+                "b_tag": row_dict["b_tag"],
+            },
+        }
+
+    await game_hub.push(gid, payload)
+    await lobby_hub.send_to(str(row_dict["w_tag"]), payload)
+    await lobby_hub.send_to(str(row_dict["b_tag"]), payload)
+    return JSONResponse({"ok": True, "game_id": new_gid})
+
+
+@app.post("/api/game/rematch_decline")
+async def game_rematch_decline(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    gid = (body.get("game_id") or "").strip()
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        if tag not in (row["w_tag"], row["b_tag"]):
+            return JSONResponse({"ok": False, "reason": "not_player"}, status_code=403)
+
+        row_dict = dict(row)
+        if row_dict["status"] != "finished":
+            return JSONResponse({"ok": False, "reason": "not_finished"}, status_code=400)
+
+        you = "w" if row_dict["w_tag"] == tag else "b"
+        offer_by = str(row_dict.get("rematch_offer_by") or "")
+        if not offer_by or offer_by == you:
+            return JSONResponse({"ok": False, "reason": "no_offer"}, status_code=400)
+
+        row_dict["rematch_offer_by"] = ""
+        save_game_state(con, row_dict)
+        con.commit()
+        row2 = load_game_row(con, gid)
+        gpub = row_to_game(row2, tag) if row2 else row_to_game(row, tag)
+
+    await game_hub.push(gid, {"type": "state", "data": gpub})
+    return JSONResponse({"ok": True, "game": gpub})
+
+
+# =========================================================
+# User & Social endpoints
+# =========================================================
+
+@app.get("/api/user/history")
+async def user_history(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    target_tag = norm_tag(req.query_params.get("tag") or tag)
+    limit = max(1, min(50, int(req.query_params.get("limit") or 20)))
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT * FROM game_results
+            WHERE white_tag=? OR black_tag=?
+            ORDER BY finished_ts DESC LIMIT ?
+            """,
+            (target_tag, target_tag, limit),
+        ).fetchall()
+        
+        results = []
+        for r in rows:
+            results.append({
+                "game_id": r["game_id"],
+                "white_tag": r["white_tag"],
+                "black_tag": r["black_tag"],
+                "winner": r["winner"],
+                "reason": r["reason"],
+                "elo_change_white": r["elo_change_white"],
+                "elo_change_black": r["elo_change_black"],
+                "finished_ts": r["finished_ts"]
+            })
+    return JSONResponse({"ok": True, "history": results})
+
+
+@app.get("/api/user/stats")
+async def user_stats(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    target_tag = norm_tag(req.query_params.get("tag") or tag)
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT game_id, white_tag, black_tag, winner, reason, elo_change_white, elo_change_black, finished_ts
+            FROM game_results
+            WHERE white_tag=? OR black_tag=?
+            ORDER BY finished_ts DESC
+            """,
+            (target_tag, target_tag),
+        ).fetchall()
+        
+        total_games = len(rows)
+        wins = 0
+        win_streak = 0
+        streak_broken = False
+        
+        last_3 = []
+        for i, r in enumerate(rows):
+            is_white = r["white_tag"] == target_tag
+            you_won = (is_white and r["winner"] == "white") or (not is_white and r["winner"] == "black")
+            
+            if i < 3:
+                last_3.append({
+                    "game_id": r["game_id"],
+                    "white_tag": r["white_tag"],
+                    "black_tag": r["black_tag"],
+                    "winner": r["winner"],
+                    "reason": r["reason"],
+                    "elo_change_white": r["elo_change_white"],
+                    "elo_change_black": r["elo_change_black"],
+                    "finished_ts": r["finished_ts"]
+                })
+                
+            if you_won:
+                wins += 1
+                if not streak_broken:
+                    win_streak += 1
+            else:
+                streak_broken = True
+                
+        win_rate = int(round((wins / total_games * 100) if total_games > 0 else 0))
+        
+        # Fetch current ELO
+        user_row = con.execute("SELECT elo FROM users WHERE tag=?", (target_tag,)).fetchone()
+        current_elo = int(user_row["elo"]) if user_row else 0
+        
+    return JSONResponse({
+        "ok": True, 
+        "stats": {
+            "elo": current_elo,
+            "win_rate": win_rate,
+            "win_streak": win_streak,
+            "total_games": total_games,
+            "last_3_matches": last_3
+        }
+    })
+
+
+@app.post("/api/social/friend_request")
+async def friend_request(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    target_tag = (body.get("target_tag") or "").strip()
+    if not target_tag:
+        return JSONResponse({"ok": False, "reason": "bad_target"}, status_code=400)
+        
+    with db() as con:
+        if not target_tag.startswith("@"):
+            if _use_postgres:
+                user = con.execute("SELECT tag FROM users WHERE LOWER(nickname)=LOWER(%s)", (target_tag,)).fetchone()
+            else:
+                user = con.execute("SELECT tag FROM users WHERE nickname=? COLLATE NOCASE", (target_tag,)).fetchone()
+            if not user:
+                return JSONResponse({"ok": False, "reason": "user_not_found"}, status_code=404)
+            target_tag = user["tag"]
+        else:
+            target_tag = norm_tag(target_tag)
+
+        if target_tag == tag:
+            return JSONResponse({"ok": False, "reason": "bad_target"}, status_code=400)
+            
+        target_user = con.execute("SELECT tag FROM users WHERE tag=?", (target_tag,)).fetchone()
+        if not target_user:
+            return JSONResponse({"ok": False, "reason": "user_not_found"}, status_code=404)
+            
+        tag_a, tag_b = (tag, target_tag) if tag < target_tag else (target_tag, tag)
+        existing = con.execute("SELECT status FROM friends WHERE tag_a=? AND tag_b=?", (tag_a, tag_b)).fetchone()
+        
+        if existing:
+            if existing["status"] == "accepted":
+                return JSONResponse({"ok": False, "reason": "already_friends"}, status_code=400)
+            return JSONResponse({"ok": False, "reason": "request_pending"}, status_code=400)
+            
+        con.execute(
+            "INSERT INTO friends(tag_a, tag_b, status, initiated_by, created_ts) VALUES (?, ?, 'pending', ?, ?)",
+            (tag_a, tag_b, tag, now_ts())
+        )
+        con.commit()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/social/friend_accept")
+async def friend_accept(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    body = await req.json()
+    target_tag = norm_tag(body.get("target_tag") or "")
+    if not target_tag:
+        return JSONResponse({"ok": False, "reason": "bad_target"}, status_code=400)
+        
+    tag_a, tag_b = (tag, target_tag) if tag < target_tag else (target_tag, tag)
+    
+    with db() as con:
+        existing = con.execute("SELECT status FROM friends WHERE tag_a=? AND tag_b=?", (tag_a, tag_b)).fetchone()
+        if not existing or existing["status"] != "pending":
+            return JSONResponse({"ok": False, "reason": "no_pending_request"}, status_code=400)
+            
+        # Verify that the user accepting is not the one who initiated
+        init_row = con.execute("SELECT initiated_by FROM friends WHERE tag_a=? AND tag_b=?", (tag_a, tag_b)).fetchone()
+        if init_row and init_row["initiated_by"] == tag:
+            return JSONResponse({"ok": False, "reason": "cannot_accept_own_request"}, status_code=400)
+            
+        con.execute("UPDATE friends SET status='accepted' WHERE tag_a=? AND tag_b=?", (tag_a, tag_b))
+        con.commit()
+
+    # Broadcast online update after friend accepted
+    asyncio.create_task(lobby_hub.broadcast_online())
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/social/friend_list")
+async def friend_list(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    with db() as con:
+        rows = con.execute(
+            "SELECT tag_a, tag_b, status FROM friends WHERE tag_a=? OR tag_b=?",
+            (tag, tag)
+        ).fetchall()
+        
+        friends = []
+        pending_incoming = []
+        pending_outgoing = []
+        
+        for r in rows:
+            other = r["tag_b"] if r["tag_a"] == tag else r["tag_a"]
+            uinfo = _get_user_info(con, other)
+            if not uinfo: continue
+
+            friend_obj = {
+                "tag": other,
+                "nickname": uinfo["nickname"],
+                "elo": uinfo["elo"],
+                "isOnline": lobby_hub.is_online(other)
+            }
+
+            if r["status"] == "accepted":
+                friends.append(friend_obj)
+            elif r["status"] == "pending":
+                initiated_by = con.execute("SELECT initiated_by FROM friends WHERE tag_a=? AND tag_b=?", (r["tag_a"], r["tag_b"])).fetchone()
+                if initiated_by and initiated_by["initiated_by"] == tag:
+                    pending_outgoing.append(friend_obj)
+                else:
+                    pending_incoming.append(friend_obj)
+                
+    return JSONResponse({
+        "ok": True, 
+        "friends": friends,
+        "pending_incoming": pending_incoming,
+        "pending_outgoing": pending_outgoing
+    })
+
+
+@app.get("/api/game/report")
+async def game_report(req: Request, tag: str = Depends(session_dep_ban_guard)):
+    gid = (req.query_params.get("game_id") or "").strip()
+    with db() as con:
+        row_db = load_game_row(con, gid)
+        if not row_db:
+            return JSONResponse({"ok": False, "reason": "no_game"}, status_code=400)
+        row = dict(row_db)
+            
+        res = {
+            "game_id": row["game_id"],
+            "economy": {
+                "coins_spent_w": int(row.get("coins_spent_w") or 0),
+                "coins_spent_b": int(row.get("coins_spent_b") or 0),
+                "pieces_bought_w": int(row.get("pieces_bought_w") or 0),
+                "pieces_bought_b": int(row.get("pieces_bought_b") or 0),
+                "pieces_lost_w": int(row.get("pieces_lost_w") or 0),
+                "pieces_lost_b": int(row.get("pieces_lost_b") or 0),
+                "bounty_earned_w": int(row.get("bounty_earned_w") or 0),
+                "bounty_earned_b": int(row.get("bounty_earned_b") or 0)
+            }
+        }
+        
+        # Calculate ROI
+        def calc_roi(spent, bought, bounty, lost):
+            if spent == 0:
+                 return 0.0
+            # A simple ROI definition: positive if you earned bounties, negative if you lost pieces you bought.
+            # But here "bounty" is earned by capturing THEIR bought pieces.
+            # Let's define simple metrics:
+            return round((bounty / max(1, spent)) * 100, 1)
+
+        res["economy"]["roi_w"] = calc_roi(res["economy"]["coins_spent_w"], res["economy"]["pieces_bought_w"], res["economy"]["bounty_earned_w"], res["economy"]["pieces_lost_w"])
+        res["economy"]["roi_b"] = calc_roi(res["economy"]["coins_spent_b"], res["economy"]["pieces_bought_b"], res["economy"]["bounty_earned_b"], res["economy"]["pieces_lost_b"])
+        
+    return JSONResponse({"ok": True, "report": res})
+
+
+# =========================================================
+# WebSocket endpoints
+# =========================================================
+@app.websocket("/ws/lobby")
+async def ws_lobby(ws: WebSocket):
+    token = ws.query_params.get("token", "")
+
+    tag = load_session_tag(token)
+    if not tag:
+        await ws.accept()
+        await ws.close(code=4401)
+        return
+
+    # NOTE: ban check intentionally removed here.
+    # Banned users must stay connected to receive ban_status_changed
+    # and support_* push notifications. API endpoints still enforce bans
+    # via session_dep_ban_guard.
+
+    await ws.accept()
+    await lobby_hub.add(tag, ws)
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await lobby_hub.remove(tag, ws)
+
+
+@app.websocket("/ws/game/{gid}")
+async def ws_game(ws: WebSocket, gid: str):
+    token = ws.query_params.get("token", "")
+
+    tag = load_session_tag(token)
+    if not tag:
+        await ws.accept()
+        await ws.close(code=4401)
+        return
+
+    with db() as con:
+        row = load_game_row(con, gid)
+        if not row:
+            await ws.accept()
+            await ws.close(code=4403)
+            return
+        if _get_active_ban_row(con, tag, now_ts()):
+            await ws.accept()
+            await ws.close(code=4402)
+            return
+        # Allow spectators (anyone with a valid session) to watch any game
+        row = refresh_game_row(con, row)
+
+    await ws.accept()
+    await game_hub.add(gid, ws)
+    await ws.send_text(json.dumps({"type": "state", "data": row_to_game(row, tag)}, ensure_ascii=False))
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        await game_hub.remove(gid, ws)
+
+
+# =========================================================
+# Startup
+# =========================================================
+@app.on_event("startup")
+async def startup_event():
+    init_database_pool()
+    init_db()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
